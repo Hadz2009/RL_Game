@@ -1,0 +1,2348 @@
+using System.Collections;
+using System.Collections.Generic;
+using UnityEngine;
+using System.Linq; // Required for LINQ operations like OrderBy
+
+public class GridManager : MonoBehaviour
+{
+    [Header("Grid Settings")]
+    public int gridWidth = 8;
+    public int gridHeight = 8;
+    public float cellSize = 0.5125f; // Smaller cell size for better fit on screen
+    [SerializeField] private GameObject cellPrefab;
+    // [Range(0, 1)] public float gridFillThreshold = 0.4f; // Threshold to switch spawning strategy -- REMOVED, replaced by DDA
+    
+    [Header("Grid Position")]
+    [SerializeField] private Vector2 gridOffset = new Vector2(-2.25f, -2.25f); // Centered for 4.5x4.5 grid
+    [SerializeField] private bool useResponsiveLayout = true; // Enable responsive layout
+    [SerializeField] [Range(0.1f, 0.3f)] private float mobileWidthAdjustment = 0.2f; // Adjust for mobile width
+    
+    [Header("Block Settings")]
+    [SerializeField] private GameObject blockPrefab;
+    [SerializeField] private Transform blocksContainer;
+    [SerializeField] private Vector2 blockSpawnArea = new Vector2(0f, -2f); // Position for spawning blocks
+    [SerializeField] public Vector3 initialBlockScale = new Vector3(0.1f, 0.1f, 0.1f); // Configurable initial scale
+    
+    [Header("Block Probability Controls")]
+    [Tooltip("Add blocks here to control their spawn probability")]
+    [SerializeField] private List<BlockProbability> customBlockProbabilities = new List<BlockProbability>();
+    [Tooltip("When enabled, prevents the same block type from appearing twice")]
+    [SerializeField] private bool preventDuplicateBlocks = true;
+    [Tooltip("Allow 3x3 blocks to be duplicated when the board is mostly empty")]
+    [SerializeField] private bool allow3x3DuplicatesWhenEmpty = true;
+    [Tooltip("Maximum board fill percentage to allow 3x3 duplicates")]
+    [Range(0.0f, 0.5f)]
+    [SerializeField] private float emptyBoardThreshold = 0.2f; // Allow 3x3 duplicates when board is less than 20% full
+    
+    [SerializeField] [Tooltip("Spacing between blocks in the dock")] private float dockBlockSpacing = 1.5f; // Configurable horizontal spacing
+    
+    // Define a class to hold custom block probabilities
+    [System.Serializable]
+    public class BlockProbability
+    {
+        [Tooltip("The exact name of the block shape")]
+        public string blockName;
+        [Tooltip("1.0 = normal chance, lower values = less frequent")]
+        [Range(0.1f, 1.0f)]
+        public float probabilityMultiplier = 1.0f; // 1.0 = normal, lower values = less frequent
+    }
+    
+    [Header("Game References")]
+    [SerializeField] private GameManager gameManager;
+    private DifficultyManager difficultyManager; // Reference to the DifficultyManager
+    
+    // Grid representation: 0 = empty, 1 = filled
+    private int[,] grid;
+    private GameObject[,] gridCells;
+    private Color[,] gridColors; // Add color tracking for each cell
+    
+    // Current blocks
+    public List<BlockShape> availableBlocks = new List<BlockShape>();
+    public List<BlockController> currentBlocks = new List<BlockController>();
+    
+    [Header("Scoring")]
+    public int pointsPerLine = 100;
+    public int comboMultiplier = 10;
+    [SerializeField] private int streakBonusBase = 50; // Base points for maintaining a streak
+    [SerializeField] private int streakExponent = 2; // Exponential growth of streak bonus
+    [SerializeField] private float streakTimeWindow = 15f; // Time window to maintain streak (seconds)
+    [SerializeField] private int maxDisplayedStreak = 10; // Maximum streak to display visually
+    private int currentStreak = 0; // Current streak counter
+    private float streakTimer = 0f; // Timer to track streak expiration
+    
+    // VFX for streaks and combos
+    [Header("Visual Feedback")]
+    [SerializeField] private GameObject streakTextPrefab; // Text popup for streaks
+    [SerializeField] private GameObject lineCompletionVFXPrefab; // Optional particle effect for line completion
+    [SerializeField] private Color[] streakColors; // Array of colors for increasing streak levels
+    
+    [Header("Player Assistance")]
+    [SerializeField] private bool enableHints = true; // Enable the hint system
+    [SerializeField] private float noMoveTimeBeforeHint = 6.0f; // Seconds before showing hint
+    [SerializeField] private float minTimeBetweenHints = 15.0f; // Minimum seconds between hints
+    [SerializeField] private GameObject hintIndicatorPrefab; // Visual indicator for hints
+    [SerializeField] private float hintPulseDuration = 1.5f; // Duration of each hint pulse
+    [SerializeField] private int maxConsecutiveHints = 3; // Max hints without player action
+    
+    private float timeSinceLastAction = 0f; // Time since player last placed a block
+    private float timeSinceLastHint = float.MaxValue; // Time since last hint was shown
+    private int consecutiveHintCount = 0; // Count consecutive hints without player action
+    private List<GameObject> activeHintIndicators = new List<GameObject>(); // Track active hint indicators
+    private bool isShowingHint = false; // Are we currently showing a hint?
+    private Coroutine activeHintCoroutine = null; // Reference to the active hint coroutine
+    
+    [Header("Game Balance Settings")]
+    [Range(0, 1)] public float clearingPotentialWeight = 0.8f; // How strongly to prioritize blocks that can clear lines (higher = more line-clearing blocks)
+    [Range(0, 1)] public float varietyWeight = 0.4f; // How much to prioritize different types of blocks (higher = more variety)
+    [SerializeField] private int consecutiveBlocksLimit = 3; // Avoid giving too many of the same category in a row
+    
+    // Time-based difficulty ramping
+    [Header("Time-Based Difficulty")]
+    [Range(0, 1)] public float funGameDuration = 0.85f; // First 85% of game is fun, line-clearing focused
+    [Range(0, 1)] public float hardGameThreshold = 0.90f; // At 90%, game gets harder with fewer line-clearing blocks
+    [Range(0, 1)] public float brutalGameThreshold = 0.95f; // At 95%, only hard blocks (was endGameForceThreshold)
+
+    // Track total blocks placed (keep this for other features but not for early game guidance)
+    private int totalBlocksPlaced = 0;
+    
+    [Header("DDA Block Categorization")]
+    // Define block shape names in Inspector. Add names from your BlockShape assets.
+    private List<string> easyShapeNames = new List<string> {
+        "Horizontal Duo", 
+        "Vertical Duo", 
+        "Triple Block", 
+        "Vertical Triple", 
+        // "Small L", 
+        // "Small J",
+        "Corner 2x2",
+        "Corner 2x2 Inverse"
+    }; 
+    private List<string> mediumShapeNames = new List<string> {
+        "Square",
+        "S Shape",
+        "Z Shape",
+        "Vertical Quadruple",
+        "Horizontal Quadruple",
+        "L Shape",
+        "J Shape",
+        "T Shape",
+        "Reverse T Shape",
+        "2x3 Rectangle",
+    }; 
+    private List<string> hardShapeNames = new List<string> {
+        "3x3",
+        "5x1",
+        "1x5",
+        "Tall L",
+        "Tall J",
+        // "Big L",
+        // "Big J",
+        "Corner 3x3",
+        "Corner 3x3 Inverse",
+        "3x2 Rectangle"
+    };
+    
+    // Additional categorization by shape type for ensuring variety
+    [Header("Shape Type Categories")]
+    [SerializeField] private List<string> singleLineShapes = new List<string> {
+        "Single Block", "Horizontal Duo", "Vertical Duo", "Triple Block", "Vertical Triple", 
+        "Horizontal Quadruple", "Vertical Quadruple", "5x1", "1x5"
+    };
+    
+    [SerializeField] private List<string> squareRectangleShapes = new List<string> {
+        "Square", "3x3", "2x3 Rectangle", "3x2 Rectangle"
+    };
+    
+    [SerializeField] private List<string> lShapes = new List<string> {
+        "Small L", "Small J", "L Shape", "J Shape", "Tall L", "Tall J", "Big L", "Big J"
+    };
+    
+    [SerializeField] private List<string> tShapes = new List<string> {
+        "T Shape", "Reverse T Shape"
+    };
+    
+    [SerializeField] private List<string> szShapes = new List<string> {
+        "S Shape", "Z Shape"
+    };
+    
+    [SerializeField] private List<string> cornerShapes = new List<string> {
+        "Corner 2x2", "Corner 2x2 Inverse", "Corner 3x3", "Corner 3x3 Inverse"
+    };
+    
+    // Board filling thresholds for early/late game strategies
+    [Header("Board Filling Strategies")]
+    [Range(0, 1)] public float earlyGameThreshold = 0.3f; // When board is less than 30% full: give big blocks to fill it quickly
+    [Range(0, 1)] public float lateGameThreshold = 0.6f; // When board is more than 60% full: prioritize line-clearing blocks
+    
+    // Also add back the recently given block categories
+    // Track recently given block categories
+    private List<string> recentBlockCategories = new List<string>();
+
+    // DDA Metrics Tracking
+    private float timeSinceLastClear = 0f;
+    private bool blockPlacedSinceLastMetricUpdate = false;
+    
+    private void Awake()
+    {
+        grid = new int[gridWidth, gridHeight];
+        gridCells = new GameObject[gridWidth, gridHeight];
+        gridColors = new Color[gridWidth, gridHeight]; // Initialize the colors array
+        
+        // Check if we need to adjust for ultrawide mobile devices like Z Fold
+        if (useResponsiveLayout)
+        {
+            AdjustForScreenAspect();
+        }
+    }
+    
+    void Start()
+    {
+        // Get the DifficultyManager instance
+        difficultyManager = DifficultyManager.Instance;
+        if (difficultyManager == null)
+        {
+            Debug.LogError("DifficultyManager instance not found! Make sure a DifficultyManager exists in the scene.");
+            enabled = false;
+            return;
+        }
+
+        Debug.Log("GridManager Start called");
+        CreateGrid();
+        
+        StartCoroutine(WaitForBlocksAndSpawn());
+    }
+    
+    void Update()
+    {
+        // Increment time since last clear if no block has been placed this frame (or since last check)
+        // Only increment if the game is actually playing (e.g., not paused, not game over)
+        if (gameManager != null && gameManager.IsGameActive() && !blockPlacedSinceLastMetricUpdate) // Assuming GameManager has IsGameActive()
+        {
+            timeSinceLastClear += Time.deltaTime;
+        }
+        // Reset the flag after checking
+        blockPlacedSinceLastMetricUpdate = false;
+        
+        // Handle streak timer countdown if we have an active streak
+        if (currentStreak > 0)
+        {
+            streakTimer -= Time.deltaTime;
+            if (streakTimer <= 0)
+            {
+                // Streak expired
+                currentStreak = 0;
+                streakTimer = 0;
+                Debug.Log("Streak expired!");
+            }
+        }
+        
+        // Check if player needs a hint
+        if (enableHints && gameManager != null && gameManager.IsGameActive())
+        {
+            timeSinceLastAction += Time.deltaTime;
+            timeSinceLastHint += Time.deltaTime;
+            
+            // Check if player has been inactive for too long and we're not already showing a hint
+            if (timeSinceLastAction > noMoveTimeBeforeHint && 
+                timeSinceLastHint > minTimeBetweenHints && 
+                !isShowingHint &&
+                consecutiveHintCount < maxConsecutiveHints)
+            {
+                ShowPlacementHint();
+            }
+        }
+    }
+    
+    private IEnumerator WaitForBlocksAndSpawn()
+    {
+        Debug.Log("Waiting for blocks to be available...");
+        while (availableBlocks.Count == 0)
+        {
+            yield return null;
+        }
+        
+        Debug.Log($"Blocks available! Count: {availableBlocks.Count}");
+        
+        // Randomize the available blocks list to ensure varied starts
+        ShuffleBlocksList();
+        
+        Debug.Log("Spawning initial blocks...");
+        SpawnBlocks(3); // Start with 3 blocks
+    }
+    
+    void CreateGrid()
+    {
+        // Create parent container for grid cells
+        GameObject gridContainer = new GameObject("GridContainer");
+        gridContainer.transform.SetParent(transform);
+        
+        // Position the grid with offset
+        gridContainer.transform.position = new Vector3(gridOffset.x, gridOffset.y, 0);
+        
+        // Calculate grid dimensions for centering
+        float totalWidth = gridWidth * cellSize;
+        float totalHeight = gridHeight * cellSize;
+        
+        // Calculate starting position to center the grid
+        float startX = -(totalWidth / 2f) + (cellSize / 2f);
+        float startY = -(totalHeight / 2f) + (cellSize / 2f);
+        
+        for (int x = 0; x < gridWidth; x++)
+        {
+            for (int y = 0; y < gridHeight; y++)
+            {
+                // Position with offset from grid container and centered
+                Vector3 position = new Vector3(
+                    startX + (x * cellSize),
+                    startY + (y * cellSize),
+                    0
+                );
+                GameObject cell = Instantiate(cellPrefab, position, Quaternion.identity);
+                cell.transform.SetParent(gridContainer.transform);
+                cell.name = $"Cell [{x}, {y}]";
+                gridCells[x, y] = cell;
+                
+                // Initialize grid
+                grid[x, y] = 0;
+            }
+        }
+    }
+    
+    // New method to handle screen aspect ratio adjustments
+    private void AdjustForScreenAspect()
+    {
+        // Get screen dimensions
+        float screenWidth = Screen.width;
+        float screenHeight = Screen.height;
+        float aspectRatio = screenWidth / screenHeight;
+        
+        Debug.Log($"Screen dimensions: {screenWidth}x{screenHeight}, Aspect ratio: {aspectRatio:F2}");
+        
+        // Check if we have an ultrawide mobile device (like Samsung Z Fold)
+        bool isUltrawide = aspectRatio > 2.0f;
+        
+        if (isUltrawide)
+        {
+            Debug.Log("Detected ultrawide screen, adjusting grid layout");
+            
+            // Make the grid wider for ultrawide screens
+            gridOffset.x = gridOffset.x - mobileWidthAdjustment;
+            
+            // Adjust block spawn area accordingly
+            blockSpawnArea.x = blockSpawnArea.x - mobileWidthAdjustment;
+        }
+    }
+    
+    public void SpawnBlocks(int count = 1)
+    {
+        for (int i = 0; i < count; i++)
+        {
+            if (currentBlocks.Count < 3)
+            {
+                // Removed game over condition check
+                Debug.Log($"Spawning block {i + 1}");
+                SpawnBlock();
+            }
+        }
+    }
+    
+    private void SpawnBlock()
+    {
+        if (availableBlocks.Count == 0)
+        {
+            Debug.LogError("No block shapes available!");
+            return;
+        }
+        
+        // Calculate metrics and update Difficulty Manager *before* selecting the next block
+        GridMetrics currentMetrics = GetGridStateMetrics();
+        if (difficultyManager != null)
+        {
+            difficultyManager.UpdateStruggleScore(currentMetrics);
+        }
+        else
+        {
+             Debug.LogError("Difficulty Manager is null during SpawnBlock!");
+             // Handle error or fallback to non-DDA logic if necessary
+        }
+
+        // Keep track of shapes that have been tried to prevent infinite loops
+        HashSet<string> triedShapes = new HashSet<string>();
+        BlockShape blockShape = null;
+        int attempts = 0;
+        
+        while (blockShape == null && attempts < 10) // Try up to 10 times for different blocks
+        {
+            // Get next candidate
+            BlockShape candidateShape = GetNextBlockShape();
+            
+            if (candidateShape == null)
+            {
+                Debug.LogWarning("GetNextBlockShape returned null.");
+                break;
+            }
+            
+            // Check if this shape is already in play (duplicate prevention)
+            bool isDuplicate = false;
+            
+            if (preventDuplicateBlocks && currentBlocks.Count > 0)
+            {
+                foreach (var block in currentBlocks)
+                {
+                    if (block.shape.shapeName == candidateShape.shapeName)
+                    {
+                        isDuplicate = true;
+                        triedShapes.Add(candidateShape.shapeName);
+                        Debug.Log($"Rejected duplicate: {candidateShape.shapeName}");
+                        break;
+                    }
+                }
+            }
+            
+            // Special case: if it's 3x3 and board is empty, we might allow duplicates
+            if (isDuplicate && candidateShape.shapeName == "3x3" && 
+                allow3x3DuplicatesWhenEmpty && CalculateBoardDensity() < emptyBoardThreshold)
+            {
+                isDuplicate = false;
+                Debug.Log("Allowing 3x3 duplicate for empty board");
+            }
+            
+            // Use this shape if it's not a duplicate or if we've tried too many times
+            if (!isDuplicate || triedShapes.Count >= availableBlocks.Count * 0.7f)
+            {
+                blockShape = candidateShape;
+            }
+            
+            attempts++;
+        }
+        
+        // If we still don't have a shape after multiple attempts, just pick one
+        if (blockShape == null && availableBlocks.Count > 0)
+        {
+            // Pick a random available shape as a fallback
+            int randomIndex = Random.Range(0, availableBlocks.Count);
+            blockShape = availableBlocks[randomIndex];
+            Debug.Log($"Fallback to random shape: {blockShape.shapeName} after {attempts} attempts");
+        }
+
+        if (blockShape == null)
+        {
+            Debug.LogWarning("Failed to find a suitable block shape.");
+            return;
+        }
+
+        Debug.Log($"Spawning block with shape: {blockShape.shapeName}");
+        
+        // Calculate spawn position (spread blocks horizontally)
+        float spacing = dockBlockSpacing; // Use inspector-configurable dock spacing
+        float xPosition = blockSpawnArea.x + (currentBlocks.Count) * spacing; 
+        Vector3 spawnPosition = new Vector3(xPosition, blockSpawnArea.y, 0);
+        
+        // Instantiate and set up block
+        if (blockPrefab == null)
+        {
+            Debug.LogError("Block Prefab not assigned!");
+            return;
+        }
+        
+        GameObject blockObj = Instantiate(blockPrefab, spawnPosition, Quaternion.identity);
+        blockObj.transform.localScale = initialBlockScale; 
+        
+        if (blocksContainer != null) { blockObj.transform.SetParent(blocksContainer); }
+        
+        BlockController controller = blockObj.GetComponent<BlockController>();
+        if (controller == null)
+        {
+            Debug.LogError("BlockController component not found on block prefab!");
+            Destroy(blockObj);
+            return;
+        }
+        
+        controller.Initialize(blockShape, this);
+        currentBlocks.Add(controller);
+        Debug.Log($"Block spawned successfully. Total blocks: {currentBlocks.Count}");
+    }
+    
+    private BlockShape GetNextBlockShape()
+    {
+        // Calculate current board density
+        float currentBoardDensity = CalculateBoardDensity();
+        Debug.Log($"Board Density: {currentBoardDensity:P1}");
+
+        // Get time pressure - used for end game
+        float timePressureBias = difficultyManager.GetTimePressureBias(); // Value from 0 (start) to 1 (end game)
+
+        // 1. Filter out shapes currently offered
+        var existingShapes = currentBlocks.Select(b => b.shape).ToHashSet();
+        var existingShapeNames = currentBlocks.Select(b => b.shape.shapeName).ToHashSet();
+        
+        // Pre-filter blocks with same names as existing blocks
+        List<BlockShape> candidateShapes = availableBlocks
+            .Where(b => !existingShapes.Contains(b) && 
+                   (!preventDuplicateBlocks || !existingShapeNames.Contains(b.shapeName) || 
+                    (b.shapeName == "3x3" && allow3x3DuplicatesWhenEmpty && currentBoardDensity < emptyBoardThreshold)))
+            .ToList();
+        
+        if (candidateShapes.Count == 0 && availableBlocks.Count > 0)
+        { 
+            // If no candidates due to duplicate prevention, allow duplicates but keep tracking them
+            candidateShapes = availableBlocks.Where(b => !existingShapes.Contains(b)).ToList();
+            Debug.Log("No unique candidates available, allowing some duplicates");
+        }
+        
+        if (candidateShapes.Count == 0) { Debug.LogError("No candidate shapes available at all!"); return null; }
+
+        // Categorize shapes based on predefined lists
+        HashSet<string> easyNames = new HashSet<string>(easyShapeNames);
+        HashSet<string> mediumNames = new HashSet<string>(mediumShapeNames);
+        HashSet<string> hardNames = new HashSet<string>(hardShapeNames);
+
+        // Additional shape type categorization
+        HashSet<string> lineNames = new HashSet<string>(singleLineShapes);
+        HashSet<string> squareRectNames = new HashSet<string>(squareRectangleShapes);
+        HashSet<string> lNames = new HashSet<string>(lShapes);
+        HashSet<string> tNames = new HashSet<string>(tShapes);
+        HashSet<string> szNames = new HashSet<string>(szShapes);
+        HashSet<string> cornerNames = new HashSet<string>(cornerShapes);
+
+        var easyShapes = candidateShapes.Where(s => easyNames.Contains(s.shapeName)).ToList();
+        var mediumShapes = candidateShapes.Where(s => mediumNames.Contains(s.shapeName)).ToList();
+        var hardShapes = candidateShapes.Where(s => hardNames.Contains(s.shapeName)).ToList();
+        
+        // Also categorize by shape type
+        var lineShapes = candidateShapes.Where(s => lineNames.Contains(s.shapeName)).ToList();
+        var squareRectShapes = candidateShapes.Where(s => squareRectNames.Contains(s.shapeName)).ToList();
+        var lJShapes = candidateShapes.Where(s => lNames.Contains(s.shapeName)).ToList();
+        var tBlockShapes = candidateShapes.Where(s => tNames.Contains(s.shapeName)).ToList();
+        var szBlockShapes = candidateShapes.Where(s => szNames.Contains(s.shapeName)).ToList();
+        var cornerBlockShapes = candidateShapes.Where(s => cornerNames.Contains(s.shapeName)).ToList();
+        
+        // Track which shape categories are already being offered
+        HashSet<string> offeredCategories = new HashSet<string>();
+        foreach (var block in currentBlocks)
+        {
+            if (block.shape != null)
+            {
+                if (lineNames.Contains(block.shape.shapeName)) offeredCategories.Add("Line");
+                if (squareRectNames.Contains(block.shape.shapeName)) offeredCategories.Add("SquareRect");
+                if (lNames.Contains(block.shape.shapeName)) offeredCategories.Add("LJ");
+                if (tNames.Contains(block.shape.shapeName)) offeredCategories.Add("T");
+                if (szNames.Contains(block.shape.shapeName)) offeredCategories.Add("SZ");
+                if (cornerNames.Contains(block.shape.shapeName)) offeredCategories.Add("Corner");
+            }
+        }
+        
+        // --- END GAME BRUTAL OVERRIDE: When timer is nearly complete, give ONLY hard blocks ---
+        if (timePressureBias >= brutalGameThreshold && hardShapes.Count > 0)
+        {
+            Debug.Log("BRUTAL END GAME OVERRIDE: Timer almost complete, forcing hardest blocks only!");
+            // Select a truly difficult hard block - preferring ones with fewer line-clearing potential
+            var sortedByDifficulty = hardShapes.OrderBy(s => EvaluateLineClearingPotential(s)).ToList();
+            
+            // Filter out shapes that would create duplicates
+            if (preventDuplicateBlocks && currentBlocks.Count > 0)
+            {
+                HashSet<string> brutalExistingShapeNames = new HashSet<string>();
+                foreach (var block in currentBlocks)
+                {
+                    if (block.shape != null)
+                    {
+                        brutalExistingShapeNames.Add(block.shape.shapeName);
+                    }
+                }
+                
+                // Remove shapes that would create duplicates
+                sortedByDifficulty = sortedByDifficulty
+                    .Where(s => !brutalExistingShapeNames.Contains(s.shapeName))
+                    .ToList();
+                    
+                // If filtering left us with no shapes, revert to original sorted list
+                if (sortedByDifficulty.Count == 0)
+                {
+                    Debug.Log("Brutal mode: No unique shapes available after filtering, allowing duplicates");
+                    sortedByDifficulty = hardShapes.OrderBy(s => EvaluateLineClearingPotential(s)).ToList();
+                }
+            }
+            
+            // Check if there is at least one placeable shape among the hard shapes
+            BlockShape placeableHardShape = FindSimplestPlaceableBlock(sortedByDifficulty);
+            
+            if (placeableHardShape != null)
+            {
+                Debug.Log($"Brutal mode: Found placeable hard shape: {placeableHardShape.shapeName}");
+                return placeableHardShape; // Return a placeable hard shape
+            }
+            else
+            {
+                Debug.Log("Brutal mode: No placeable hard shapes found, falling back to easier shapes");
+                
+                // Try medium shapes
+                var mediumShapesList = availableBlocks.Where(s => mediumShapeNames.Contains(s.shapeName)).ToList();
+                BlockShape placeableMediumShape = FindSimplestPlaceableBlock(mediumShapesList);
+                
+                if (placeableMediumShape != null)
+                {
+                    Debug.Log($"Brutal mode fallback: Using placeable medium shape: {placeableMediumShape.shapeName}");
+                    return placeableMediumShape;
+                }
+                
+                // If still nothing, try easy shapes
+                var easyShapesList = availableBlocks.Where(s => easyShapeNames.Contains(s.shapeName)).ToList();
+                BlockShape placeableEasyShape = FindSimplestPlaceableBlock(easyShapesList);
+                
+                if (placeableEasyShape != null)
+                {
+                    Debug.Log($"Brutal mode fallback: Using placeable easy shape: {placeableEasyShape.shapeName}");
+                    return placeableEasyShape;
+                }
+                
+                // Last resort - try ALL available shapes to find something, anything placeable
+                BlockShape anyPlaceableShape = FindSimplestPlaceableBlock(availableBlocks);
+                if (anyPlaceableShape != null)
+                {
+                    Debug.Log($"Brutal mode emergency fallback: Found placeable shape: {anyPlaceableShape.shapeName}");
+                    return anyPlaceableShape;
+                }
+                
+                // If we get here, there's really no placeable shape left (game should end)
+                Debug.LogWarning("CRITICAL: No placeable shapes found at all! Game should end naturally soon.");
+                return sortedByDifficulty[0]; // Return at least something, even if unplaceable
+            }
+        }
+        
+        // --- FUN MAIN GAMEPLAY (FIRST 85-90% OF THE GAME) ---
+        // Evaluate all blocks for their fun potential (clearing lines, filling board strategically)
+        if (timePressureBias < hardGameThreshold)
+        {
+            // Prioritize shapes from categories not currently offered
+            List<BlockShape> shapesFromMissingCategories = new List<BlockShape>();
+            
+            if (!offeredCategories.Contains("Line") && lineShapes.Count > 0)
+                shapesFromMissingCategories.AddRange(lineShapes);
+                
+            if (!offeredCategories.Contains("SquareRect") && squareRectShapes.Count > 0)
+                shapesFromMissingCategories.AddRange(squareRectShapes);
+                
+            if (!offeredCategories.Contains("LJ") && lJShapes.Count > 0)
+                shapesFromMissingCategories.AddRange(lJShapes);
+                
+            if (!offeredCategories.Contains("T") && tBlockShapes.Count > 0)
+                shapesFromMissingCategories.AddRange(tBlockShapes);
+                
+            if (!offeredCategories.Contains("SZ") && szBlockShapes.Count > 0)
+                shapesFromMissingCategories.AddRange(szBlockShapes);
+                
+            if (!offeredCategories.Contains("Corner") && cornerBlockShapes.Count > 0)
+                shapesFromMissingCategories.AddRange(cornerBlockShapes);
+            
+            // If we have shapes from missing categories, prioritize those
+            if (shapesFromMissingCategories.Count > 0)
+            {
+                candidateShapes = shapesFromMissingCategories;
+                Debug.Log($"Prioritizing {shapesFromMissingCategories.Count} shapes from missing categories for variety");
+            }
+
+            // --- ANALYZE ALL BLOCKS FOR THEIR POTENTIAL ---
+            Dictionary<BlockShape, float> blockScores = new Dictionary<BlockShape, float>();
+            
+            // Dynamic clearing weight adjustment - increase clearing weight in middle game
+            float dynamicClearingWeight = clearingPotentialWeight;
+            if (timePressureBias > funGameDuration && timePressureBias < hardGameThreshold)
+            {
+                // Gradually reduce clearing weight as we approach hard game threshold
+                float transitionProgress = (timePressureBias - funGameDuration) / (hardGameThreshold - funGameDuration);
+                dynamicClearingWeight = Mathf.Lerp(clearingPotentialWeight, 0.3f, transitionProgress);
+                Debug.Log($"Transition phase: Reducing clearing weight to {dynamicClearingWeight:F2}");
+            }
+            
+            // Evaluate each shape on multiple criteria 
+            foreach (BlockShape shape in candidateShapes)
+            {
+                // 1. Line clearing potential - use a more thorough evaluation
+                int clearingPotential = EvaluateLineClearingPotential(shape);
+                
+                // 2. Size/complexity (prefer bigger blocks in early game, more tactical in mid-game)
+                int complexity = shape.GetComplexity();
+                
+                // 3. Category bonus/penalty based on recent history (encourage variety)
+                float categoryBonus = CalculateCategoryBonus(shape, easyNames, mediumNames, hardNames);
+                
+                // 4. Board state specific score
+                float boardSpecificScore = 0f;
+                
+                // Early game: Prefer bigger blocks to fill the board when empty
+                if (currentBoardDensity < earlyGameThreshold)
+                {
+                    // Give preference to bigger/more complex blocks to fill the board quickly
+                    boardSpecificScore = Mathf.Min(1.0f, complexity / 10f);
+                }
+                // Late game: Heavily prefer clearing blocks if board getting full
+                else if (currentBoardDensity > lateGameThreshold)
+                {
+                    boardSpecificScore = clearingPotential > 0 ? 0.8f : 0f; // Strong bonus if can clear lines
+                }
+                // Mid game: Balance between clearing and building
+                else
+                {
+                    // Balance between complexity and clearing with bias toward clearing
+                    boardSpecificScore = (clearingPotential * 0.8f) + (Mathf.Min(1.0f, complexity / 10f) * 0.2f);
+                }
+                
+                // NEW: Apply custom probability multiplier if defined
+                float customProbabilityMultiplier = 1.0f;
+                foreach (var blockProb in customBlockProbabilities)
+                {
+                    if (blockProb.blockName == shape.shapeName)
+                    {
+                        customProbabilityMultiplier = blockProb.probabilityMultiplier;
+                        Debug.Log($"Applied custom probability {customProbabilityMultiplier} to {shape.shapeName}");
+                        break;
+                    }
+                }
+                
+                // Calculate total block score with dynamic weights
+                float totalScore = 
+                    (clearingPotential * dynamicClearingWeight) + 
+                    (boardSpecificScore * 0.4f) + 
+                    (categoryBonus * varietyWeight);
+                
+                // Apply custom probability multiplier
+                totalScore *= customProbabilityMultiplier;
+                
+                blockScores[shape] = totalScore;
+            }
+            
+            // Select from top scoring blocks with some randomness to keep it interesting
+            List<BlockShape> topBlocks = blockScores.OrderByDescending(kvp => kvp.Value)
+                                                  .Take(3) // Take top 3 candidates
+                                                  .Select(kvp => kvp.Key)
+                                                  .ToList();
+            
+            if (topBlocks.Count > 0)
+            {
+                // Slightly randomize selection from top blocks
+                float rand = Random.value;
+                BlockShape selectedShape;
+                
+                if (rand < 0.7f && topBlocks.Count >= 1)
+                {
+                    selectedShape = topBlocks[0]; // Top block (70% chance)
+                }
+                else if (rand < 0.9f && topBlocks.Count >= 2)
+                {
+                    selectedShape = topBlocks[1]; // Second best (20% chance)
+                }
+                else if (topBlocks.Count >= 3)
+                {
+                    selectedShape = topBlocks[2]; // Third best (10% chance)
+                }
+                else
+                {
+                    selectedShape = topBlocks[0]; // Default to best if not enough blocks
+                }
+                
+                // Update recent categories
+                UpdateRecentCategories(selectedShape, easyNames, mediumNames, hardNames);
+                
+                Debug.Log($"Selected block '{selectedShape.shapeName}' based on fun gameplay factors. Score: {blockScores[selectedShape]:F2}");
+                return selectedShape;
+            }
+        }
+        
+        // --- HARD END GAME (90-95% of time) ---
+        // Drift into increasingly difficult play
+        if (timePressureBias >= hardGameThreshold && timePressureBias < brutalGameThreshold)
+        {
+            Debug.Log("HARD END GAME: Forcing more difficult blocks.");
+            // Assign fixed probabilities for the harder end game
+            float hardProb = 0.7f;  // High chance for hard blocks
+            float mediumProb = 0.25f; // Some medium blocks
+            float easyProb = 0.05f;   // Minimal chance for easy blocks
+            
+            // As we get closer to brutal threshold, increase hard probability
+            float progressTowardBrutal = (timePressureBias - hardGameThreshold) / (brutalGameThreshold - hardGameThreshold);
+            hardProb = Mathf.Lerp(hardProb, 1.0f, progressTowardBrutal);
+            mediumProb = Mathf.Lerp(mediumProb, 0.0f, progressTowardBrutal);
+            easyProb = Mathf.Lerp(easyProb, 0.0f, progressTowardBrutal);
+            
+            // Select category based on probability
+            List<BlockShape> categoryPool = null;
+            float randomValue = Random.value;
+            
+            if (randomValue < easyProb && easyShapes.Count > 0)
+            {
+                categoryPool = easyShapes;
+            }
+            else if (randomValue < easyProb + mediumProb && mediumShapes.Count > 0)
+            {
+                categoryPool = mediumShapes;
+            }
+            else if (hardShapes.Count > 0)
+            {
+                categoryPool = hardShapes;
+            }
+            else
+            {
+                // Fallback if chosen category is empty
+                if (hardShapes.Count > 0) categoryPool = hardShapes;
+                else if (mediumShapes.Count > 0) categoryPool = mediumShapes;
+                else categoryPool = easyShapes; // Last resort
+            }
+            
+            // If even the fallback results in no shapes, use all candidates
+            if (categoryPool == null || categoryPool.Count == 0)
+            {
+                categoryPool = candidateShapes;
+            }
+            
+            // Filter out shapes that would create duplicates
+            if (preventDuplicateBlocks && currentBlocks.Count > 0)
+            {
+                HashSet<string> hardModeExistingShapeNames = new HashSet<string>();
+                foreach (var block in currentBlocks)
+                {
+                    if (block.shape != null)
+                    {
+                        hardModeExistingShapeNames.Add(block.shape.shapeName);
+                    }
+                }
+                
+                // Remove shapes that would create duplicates
+                categoryPool = categoryPool
+                    .Where(s => !hardModeExistingShapeNames.Contains(s.shapeName) || 
+                           (s.shapeName == "3x3" && allow3x3DuplicatesWhenEmpty && currentBoardDensity < emptyBoardThreshold))
+                    .ToList();
+                    
+                // If filtering left us with no shapes, revert to original pool
+                if (categoryPool.Count == 0)
+                {
+                    Debug.Log("Hard mode: No unique shapes available after filtering, allowing duplicates");
+                    categoryPool = candidateShapes;
+                }
+            }
+            
+            // NEW: Apply custom probabilities to the pool
+            Dictionary<BlockShape, float> weightedPool = new Dictionary<BlockShape, float>();
+            foreach (var shape in categoryPool)
+            {
+                float weight = 1.0f;
+                // Find if this shape has a custom probability
+                foreach (var blockProb in customBlockProbabilities)
+                {
+                    if (blockProb.blockName == shape.shapeName)
+                    {
+                        weight = blockProb.probabilityMultiplier;
+                        break;
+                    }
+                }
+                weightedPool[shape] = weight;
+            }
+            
+            // Select based on weighted probabilities
+            if (weightedPool.Count > 0)
+            {
+                float totalWeight = weightedPool.Values.Sum();
+                float randomPoint = Random.value * totalWeight;
+                float accumulatedWeight = 0f;
+                
+                foreach (var kvp in weightedPool)
+                {
+                    accumulatedWeight += kvp.Value;
+                    if (randomPoint <= accumulatedWeight)
+                    {
+                        BlockShape selectedEndGameShape = kvp.Key;
+                        UpdateRecentCategories(selectedEndGameShape, easyNames, mediumNames, hardNames);
+                        return selectedEndGameShape;
+                    }
+                }
+                // Fallback in case of rounding errors
+                BlockShape selectedFallbackShape = weightedPool.Keys.Last();
+                UpdateRecentCategories(selectedFallbackShape, easyNames, mediumNames, hardNames);
+                return selectedFallbackShape;
+            }
+        }
+        
+        // --- FALLBACK / NORMAL DDA LOGIC ---
+        // This should only be reached if the fun gameplay selection somehow failed
+
+        // --- Fallback to normal DDA Probability Adjustment ---
+        float adjustmentFactor = difficultyManager.GetTier1AdjustmentFactor();
+        float netBias = adjustmentFactor - (timePressureBias * difficultyManager.maxAdjustmentFactor * 1.5f);
+
+        // Calculate base probabilities
+        float baseEasyProb = 0.33f;
+        float baseMediumProb = 0.34f;
+        float baseHardProb = 0.33f;
+
+        // Adjust based on net bias
+        float adjustedEasyProb = Mathf.Clamp01(baseEasyProb + netBias);
+        float adjustedHardProb = Mathf.Clamp01(baseHardProb - netBias);
+        float adjustedMediumProb = 1.0f - adjustedEasyProb - adjustedHardProb;
+
+        // Ensure medium prob isn't negative
+        if (adjustedMediumProb < 0)
+        {
+            adjustedMediumProb = 0;
+            float sum = adjustedEasyProb + adjustedHardProb;
+            if (sum > 0)
+            {
+                adjustedEasyProb /= sum;
+                adjustedHardProb /= sum;
+            }
+            else
+            {
+                adjustedEasyProb = 0.5f;
+                adjustedHardProb = 0.5f;
+            }
+        }
+
+        // Filter out shapes that would create duplicates
+        HashSet<string> fallbackExistingShapeNames = new HashSet<string>();
+        if (preventDuplicateBlocks && currentBlocks.Count > 0)
+        {
+            foreach (var block in currentBlocks)
+            {
+                if (block.shape != null)
+                {
+                    fallbackExistingShapeNames.Add(block.shape.shapeName);
+                }
+            }
+            
+            // Filter categories based on duplicates
+            if (easyShapes.Count > 0)
+            {
+                easyShapes = easyShapes.Where(s => !fallbackExistingShapeNames.Contains(s.shapeName)).ToList();
+            }
+            
+            if (mediumShapes.Count > 0)
+            {
+                mediumShapes = mediumShapes.Where(s => !fallbackExistingShapeNames.Contains(s.shapeName)).ToList();
+            }
+            
+            if (hardShapes.Count > 0)
+            {
+                hardShapes = hardShapes.Where(s => !fallbackExistingShapeNames.Contains(s.shapeName)).ToList();
+            }
+            
+            // Special case for 3x3 when board is mostly empty
+            if (fallbackExistingShapeNames.Contains("3x3") && allow3x3DuplicatesWhenEmpty && CalculateBoardDensity() < emptyBoardThreshold)
+            {
+                Debug.Log("Allowing 3x3 duplicate for empty board in fallback logic");
+                var shape3x3 = availableBlocks.FirstOrDefault(s => s.shapeName == "3x3");
+                if (shape3x3 != null)
+                {
+                    // Add to appropriate category if it exists
+                    if (hardNames.Contains("3x3")) hardShapes.Add(shape3x3);
+                }
+            }
+        }
+
+        // Select category based on adjusted probabilities
+        List<BlockShape> fallbackPool = null;
+        float randValue = Random.value;
+
+        if (randValue < adjustedEasyProb && easyShapes.Count > 0)
+        {
+            fallbackPool = easyShapes;
+        }
+        else if (randValue < adjustedEasyProb + adjustedMediumProb && mediumShapes.Count > 0)
+        {
+            fallbackPool = mediumShapes;
+        }
+        else if (hardShapes.Count > 0)
+        {
+            fallbackPool = hardShapes;
+        }
+        else
+        {
+            // If all filtered pools are empty, use all candidate shapes but still filter duplicates
+            fallbackPool = candidateShapes;
+            if (preventDuplicateBlocks && currentBlocks.Count > 0)
+            {
+                fallbackPool = fallbackPool
+                    .Where(s => !fallbackExistingShapeNames.Contains(s.shapeName) || 
+                            (s.shapeName == "3x3" && allow3x3DuplicatesWhenEmpty && CalculateBoardDensity() < emptyBoardThreshold))
+                    .ToList();
+            }
+        }
+
+        // If we ended up with no shapes after all the filtering, allow duplicates as last resort
+        if (fallbackPool == null || fallbackPool.Count == 0)
+        {
+            Debug.Log("Fallback: No unique shapes available after filtering, allowing duplicates");
+            fallbackPool = candidateShapes;
+        }
+
+        // Select a random block from the chosen category
+        BlockShape fallbackShape = fallbackPool[Random.Range(0, fallbackPool.Count)];
+        UpdateRecentCategories(fallbackShape, easyNames, mediumNames, hardNames);
+
+        return fallbackShape;
+    }
+    
+    // Helper method to evaluate how well a block can clear lines on the current board
+    private int EvaluateLineClearingPotential(BlockShape shape)
+    {
+        int maxClearCount = 0;
+        int positionsChecked = 0;
+        int validPlacements = 0;
+        
+        // More thorough check - scan entire board
+        for (int x = 0; x < gridWidth; x++)
+        {
+            for (int y = 0; y < gridHeight; y++)
+            {
+                Vector2Int pos = new Vector2Int(x, y);
+                positionsChecked++;
+                
+                if (CanPlaceBlock(shape, pos))
+                {
+                    validPlacements++;
+                    int clearCount = SimulatePlacementAndCheckClears(shape, pos);
+                    maxClearCount = Mathf.Max(maxClearCount, clearCount);
+                    
+                    // Early exit if we found a great position that clears multiple lines
+                    if (clearCount >= 3) 
+                    {
+                        return clearCount + 2; // Bonus for exceptional clearing potential
+                    }
+                    else if (clearCount >= 2)
+                    {
+                        return clearCount + 1; // Bonus for good clearing potential
+                    }
+                }
+            }
+        }
+        
+        // Bonus factor for shapes that can be placed in many positions
+        float placementFlexibilityBonus = 0;
+        if (positionsChecked > 0)
+        {
+            float placementRatio = (float)validPlacements / positionsChecked;
+            placementFlexibilityBonus = placementRatio * 0.5f; // Up to 0.5 bonus for very flexible pieces
+        }
+        
+        // Return clearing potential with flexibility bonus
+        return maxClearCount + Mathf.RoundToInt(placementFlexibilityBonus);
+    }
+    
+    // Calculate bonus/penalty based on recent block categories 
+    private float CalculateCategoryBonus(BlockShape shape, HashSet<string> easyNames, HashSet<string> mediumNames, HashSet<string> hardNames)
+    {
+        string category = GetShapeCategory(shape, easyNames, mediumNames, hardNames);
+        
+        // Check if we've given too many blocks of this category recently
+        int sameCount = 0;
+        for (int i = 0; i < Mathf.Min(consecutiveBlocksLimit, recentBlockCategories.Count); i++)
+        {
+            if (recentBlockCategories[i] == category)
+            {
+                sameCount++;
+            }
+        }
+        
+        // Calculate penalty - more penalty for more repeats
+        float penalty = sameCount * 0.2f; // 0.2 penalty per repeat
+        
+        return Mathf.Clamp01(1.0f - penalty); // 1.0 = no penalty, lower = more penalty
+    }
+    
+    // Get the category of a shape
+    private string GetShapeCategory(BlockShape shape, HashSet<string> easyNames, HashSet<string> mediumNames, HashSet<string> hardNames)
+    {
+        if (easyNames.Contains(shape.shapeName)) return "Easy";
+        if (mediumNames.Contains(shape.shapeName)) return "Medium";
+        if (hardNames.Contains(shape.shapeName)) return "Hard";
+        return "Unknown";
+    }
+    
+    // Update the list of recent block categories
+    private void UpdateRecentCategories(BlockShape shape, HashSet<string> easyNames, HashSet<string> mediumNames, HashSet<string> hardNames)
+    {
+        string category = GetShapeCategory(shape, easyNames, mediumNames, hardNames);
+        
+        // Add to front
+        recentBlockCategories.Insert(0, category);
+        
+        // Trim list if needed
+        if (recentBlockCategories.Count > consecutiveBlocksLimit)
+        {
+            recentBlockCategories.RemoveAt(recentBlockCategories.Count - 1);
+        }
+    }
+
+    // Helper to check if a shape can be placed anywhere on the current grid
+    private bool IsShapePlaceableAnywhere(BlockShape shape)
+    {
+        for (int x = 0; x < gridWidth; x++)
+        {
+            for (int y = 0; y < gridHeight; y++)
+            {
+                Vector2Int currentPos = new Vector2Int(x, y);
+                if (CanPlaceBlock(shape, currentPos))
+                {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    // ** KEPT/REUSED ** Helper: Find simplest placeable block from candidates
+    private BlockShape FindSimplestPlaceableBlock(List<BlockShape> candidates)
+    {
+        BlockShape bestShape = null;
+        int minComplexity = int.MaxValue;
+
+        foreach (BlockShape shape in candidates.OrderBy(s => s.GetComplexity())) // Check simplest first
+        {
+            if (IsShapePlaceableAnywhere(shape))
+            {
+                 int complexity = shape.GetComplexity();
+                 if (complexity < minComplexity) // Should catch the first placeable due to OrderBy
+                 {
+                      minComplexity = complexity;
+                      bestShape = shape;
+                      return bestShape; // Found the simplest placeable
+                 }
+            }
+        }
+        // If loop finishes, no block in candidates is placeable
+         if (bestShape == null && candidates.Count > 0) {
+             Debug.LogWarning($"FindSimplestPlaceableBlock: Could not find any placeable block among {candidates.Count} candidates.");
+         }
+        return bestShape;
+    }
+
+    // ** RENAMED ** Was GetGridFillPercentage
+    private float CalculateBoardDensity()
+    {
+        int filledCount = 0;
+        int totalCells = gridWidth * gridHeight;
+        if (totalCells == 0) return 0f;
+        for (int x = 0; x < gridWidth; x++) { for (int y = 0; y < gridHeight; y++) { if (grid[x, y] == 1) filledCount++; } }
+        return (float)filledCount / totalCells;
+    }
+
+    // SimulatePlacementAndCheckClears unchanged
+    private int SimulatePlacementAndCheckClears(BlockShape shape, Vector2Int position)
+    {
+        // Create a temporary copy of the grid
+        int[,] tempGrid = (int[,])grid.Clone();
+
+        // Simulate placing the block
+        foreach (Vector2Int cell in shape.cells)
+        {
+            Vector2Int gridPos = position + cell;
+            // Basic bounds check (redundant if CanPlaceBlock was called first, but safe)
+            if (gridPos.x >= 0 && gridPos.x < gridWidth && gridPos.y >= 0 && gridPos.y < gridHeight)
+            {
+                 tempGrid[gridPos.x, gridPos.y] = 1;
+            }
+            else
+            {
+                 // This shouldn't happen if CanPlaceBlock was true
+                 // Debug.LogError("Simulating placement outside bounds!");
+                 return 0; // Invalid placement simulation
+            }
+        }
+
+        // Simulate checking lines on the temporary grid
+        int linesCleared = 0;
+        // Check rows
+        for (int y = 0; y < gridHeight; y++)
+        {
+            bool rowComplete = true;
+            for (int x = 0; x < gridWidth; x++)
+            {
+                if (tempGrid[x, y] == 0) { rowComplete = false; break; }
+            }
+            if (rowComplete) { linesCleared++; }
+        }
+        // Check columns
+        for (int x = 0; x < gridWidth; x++)
+        {
+            bool columnComplete = true;
+            for (int y = 0; y < gridHeight; y++)
+            {
+                if (tempGrid[x, y] == 0) { columnComplete = false; break; }
+            }
+            if (columnComplete) { linesCleared++; }
+        }
+
+        // Return the count of lines that *would* be cleared
+        return linesCleared;
+    }
+
+    // ** KEPT ** Was used for IsGameOver
+    private List<BlockShape> FindPlaceableBlocks()
+    {
+        // This checks *all* available blocks, ignoring candidates/filtering
+        List<BlockShape> placeable = new List<BlockShape>();
+        foreach (BlockShape shape in availableBlocks) 
+        {
+            for (int x = 0; x < gridWidth; x++)
+            {
+                for (int y = 0; y < gridHeight; y++)
+                {
+                    if (CanPlaceBlock(shape, new Vector2Int(x, y)))
+                    {
+                        placeable.Add(shape);
+                        goto NextShape;
+                    }
+                }
+            }
+            NextShape:;
+        }
+        // Debug.Log($"FindPlaceableBlocks (Full Scan): Found {placeable.Count} placeable shapes.");
+        return placeable;
+    }
+    
+    public bool TryPlaceBlock(BlockShape shape, Vector2Int position)
+    {
+        if (!CanPlaceBlock(shape, position)) { return false; }
+        
+        // Reset player inactivity timers since they placed a block
+        timeSinceLastAction = 0f;
+        consecutiveHintCount = 0; // Reset consecutive hint counter
+        
+        // Hide any active hints when player places a block
+        HideAllHints();
+        
+        // Place the block
+        foreach (Vector2Int cell in shape.cells)
+        {
+            Vector2Int gridPos = position + cell;
+            grid[gridPos.x, gridPos.y] = 1;
+            gridColors[gridPos.x, gridPos.y] = shape.blockColor; // Store the block's color
+            
+            // Update visuals
+            UpdateCellVisual(gridPos.x, gridPos.y, true);
+        }
+        
+        blockPlacedSinceLastMetricUpdate = true; // Flag that placement occurred
+        totalBlocksPlaced++; // Increment the total blocks placed counter
+
+        // Check and clear completed lines
+        int linesCleared = CheckAndClearLines();
+        
+        // Award points
+        if (linesCleared > 0)
+        {
+            // Increase streak and reset timer when clearing lines
+            currentStreak++;
+            // Calculate streak bonus using exponential growth
+            int streakBonus = currentStreak > 1 ? streakBonusBase * Mathf.RoundToInt(Mathf.Pow(streakExponent, Mathf.Min(5, currentStreak - 1))) : 0;
+            
+            // Reset streak timer
+            streakTimer = streakTimeWindow;
+            
+            // Calculate total score with combo and streak
+            int comboBonus = (difficultyManager != null ? difficultyManager.GetConsecutiveSuccesses() : 0) * comboMultiplier;
+            int baseScore = linesCleared * pointsPerLine;
+            int totalScore = baseScore + comboBonus + streakBonus;
+            
+            Debug.Log($"Lines: {linesCleared}, Streak: {currentStreak}, Streak Bonus: {streakBonus}, Total: {totalScore}");
+            
+            // Show streak VFX if we have a streak
+            if (currentStreak > 1 && streakTextPrefab != null)
+            {
+                ShowStreakVFX(position, linesCleared);
+            }
+            
+            // Add score to game manager
+            if (gameManager != null) { gameManager.AddScore(totalScore); }
+
+            // --- DDA Reporting ---
+            if (difficultyManager != null) { difficultyManager.RecordSuccess(); }
+            timeSinceLastClear = 0f; // Reset timer on success
+        }
+        else
+        {
+            // --- DDA Reporting ---
+            if (difficultyManager != null) { difficultyManager.RecordFailure(); }
+            Debug.Log("Block placed, no lines cleared. Failure recorded.");
+            // timeSinceLastClear continues incrementing in Update()
+        }
+        
+        return true;
+    }
+    
+    public bool CanPlaceBlock(BlockShape shape, Vector2Int position)
+    {
+        foreach (Vector2Int cell in shape.cells)
+        {
+            Vector2Int gridPos = position + cell;
+            
+            // Check if out of bounds
+            if (gridPos.x < 0 || gridPos.x >= gridWidth || gridPos.y < 0 || gridPos.y >= gridHeight)
+            {
+                return false;
+            }
+            
+            // Check if cell is already occupied
+            if (grid[gridPos.x, gridPos.y] == 1)
+            {
+                return false;
+            }
+            
+        }
+        return true;
+    }
+    
+    private void UpdateCellVisual(int x, int y, bool filled)
+    {
+        // Update the visual appearance of the cell based on whether it's filled
+        if (gridCells[x, y] != null)
+        {
+            // Using cell behavior to update visual
+            CellBehavior cellBehavior = gridCells[x, y].GetComponent<CellBehavior>();
+            if (cellBehavior != null)
+            {
+                // Pass the color if filled, otherwise use white (empty)
+                Color cellColor = filled ? gridColors[x, y] : Color.white;
+                cellBehavior.SetFilledWithColor(filled, cellColor);
+            }
+            else
+            {
+                // Fallback to direct sprite renderer update
+                SpriteRenderer renderer = gridCells[x, y].GetComponent<SpriteRenderer>();
+                if (renderer != null)
+                {
+                    // Use the stored color if filled, otherwise white
+                    renderer.color = filled ? gridColors[x, y] : Color.white;
+                }
+            }
+        }
+    }
+    
+    private int CheckAndClearLines()
+    {
+        int linesCleared = 0;
+        
+        // Create lists to store row and column indices that need to be cleared
+        List<int> rowsToClear = new List<int>();
+        List<int> columnsToClear = new List<int>();
+        
+        // Check rows
+        for (int y = 0; y < gridHeight; y++)
+        {
+            bool rowComplete = true;
+            for (int x = 0; x < gridWidth; x++)
+            {
+                if (grid[x, y] == 0)
+                {
+                    rowComplete = false;
+                    break;
+                }
+            }
+            
+            if (rowComplete)
+            {
+                rowsToClear.Add(y);
+                linesCleared++;
+            }
+        }
+        
+        // Check columns
+        for (int x = 0; x < gridWidth; x++)
+        {
+            bool columnComplete = true;
+            for (int y = 0; y < gridHeight; y++)
+            {
+                if (grid[x, y] == 0)
+                {
+                    columnComplete = false;
+                    break;
+                }
+            }
+            
+            if (columnComplete)
+            {
+                columnsToClear.Add(x);
+                linesCleared++;
+            }
+        }
+        
+        // Clear all identified rows and columns
+        foreach (int row in rowsToClear)
+        {
+            ClearRow(row);
+        }
+        
+        foreach (int column in columnsToClear)
+        {
+            ClearColumn(column);
+        }
+        
+        return linesCleared;
+    }
+    
+    private void ClearRow(int row)
+    {
+        // Only start the visual animation - actual clearing is now done in the animation
+        StartCoroutine(FlashRow(row));
+    }
+    
+    private void ClearColumn(int column)
+    {
+        // Only start the visual animation - actual clearing is now done in the animation
+        StartCoroutine(FlashColumn(column));
+    }
+    
+    // Rainbow color generator for Knight Rider effect
+    private Color GetRainbowColor(float position) 
+    {
+        // Position should be between 0-1 for a full rainbow cycle
+        float r = Mathf.Sin(position * 2 * Mathf.PI) * 0.5f + 0.5f;
+        float g = Mathf.Sin((position + 0.33f) * 2 * Mathf.PI) * 0.5f + 0.5f;
+        float b = Mathf.Sin((position + 0.67f) * 2 * Mathf.PI) * 0.5f + 0.5f;
+        
+        // Increase saturation by boosting the max channel
+        float max = Mathf.Max(r, Mathf.Max(g, b));
+        if (max < 0.8f) {
+            float boost = 0.8f / (max + 0.0001f);
+            r *= boost;
+            g *= boost;
+            b *= boost;
+        }
+        
+        return new Color(r, g, b, 1f);
+    }
+
+    private IEnumerator FlashRow(int row)
+    {
+        // Enhanced Knight Rider style animation from left to right with rainbow effect
+        const int trailLength = 4; // Length of the color trail
+        
+        // First pass - a bright flash to signify the line was completed
+        for (int i = 0; i < 3; i++) // Flash 3 times
+        {
+            // Flash the entire row with bright white
+            for (int x = 0; x < gridWidth; x++)
+            {
+                UpdateCellWithColor(x, row, Color.white);
+            }
+            
+            yield return new WaitForSeconds(0.05f);
+            
+            // Flash with a gradient rainbow
+            for (int x = 0; x < gridWidth; x++)
+            {
+                float colorPos = ((float)x / gridWidth) + (Time.time * 0.1f);
+                Color rainbowColor = GetEnhancedRainbowColor(colorPos % 1);
+                UpdateCellWithColor(x, row, rainbowColor);
+            }
+            
+            yield return new WaitForSeconds(0.05f);
+        }
+        
+        // Second pass - light sweeps across
+        for (int x = -trailLength; x < gridWidth + trailLength; x++)
+        {
+            // Update cells in the current window with rainbow colors
+            for (int offset = 0; offset < trailLength; offset++)
+            {
+                int currentX = x - offset;
+                
+                if (currentX >= 0 && currentX < gridWidth)
+                {
+                    // Get a rainbow color based on position and time
+                    float colorPos = ((float)currentX / gridWidth) + (Time.time * 0.1f);
+                    
+                    // Use rainbow position + offset for the trail
+                    Color rainbowColor = GetEnhancedRainbowColor(colorPos % 1);
+                    
+                    // Fade alpha based on position in trail (head of trail is brightest)
+                    float alpha = 1.0f - ((float)offset / trailLength);
+                    rainbowColor.a = Mathf.Clamp(alpha * 1.5f, 0.1f, 1f);
+                    
+                    UpdateCellWithColor(currentX, row, rainbowColor);
+                }
+            }
+            
+            // Clear cells that are no longer in the effect range
+            if (x - trailLength >= 0 && x - trailLength < gridWidth)
+            {
+                // Use dark gray cell background instead of pure white
+                UpdateCellWithColor(x - trailLength, row, new Color(0.2f, 0.2f, 0.22f));
+            }
+            
+            yield return new WaitForSeconds(0.020f); // Speed up slightly for smoother animation
+        }
+        
+        // Add a small radial shockwave effect at the end
+        StartCoroutine(ShockwaveEffect(row, true));
+        
+        // Now actually clear the row in the grid data
+        for (int x = 0; x < gridWidth; x++)
+        {
+            // Only clear if not already cleared
+            if (grid[x, row] == 1)
+            {
+                grid[x, row] = 0;
+            }
+        }
+    }
+    
+    private IEnumerator FlashColumn(int column)
+    {
+        // Enhanced Knight Rider style animation from bottom to top with rainbow effect
+        const int trailLength = 4; // Length of the color trail
+        
+        // First pass - a bright flash to signify the line was completed
+        for (int i = 0; i < 3; i++) // Flash 3 times
+        {
+            // Flash the entire column with bright white
+            for (int y = 0; y < gridHeight; y++)
+            {
+                UpdateCellWithColor(column, y, Color.white);
+            }
+            
+            yield return new WaitForSeconds(0.05f);
+            
+            // Flash with a gradient rainbow
+            for (int y = 0; y < gridHeight; y++)
+            {
+                float colorPos = ((float)y / gridHeight) + (Time.time * 0.1f);
+                Color rainbowColor = GetEnhancedRainbowColor(colorPos % 1);
+                UpdateCellWithColor(column, y, rainbowColor);
+            }
+            
+            yield return new WaitForSeconds(0.05f);
+        }
+        
+        // Second pass - light sweeps upward
+        for (int y = -trailLength; y < gridHeight + trailLength; y++)
+        {
+            // Update cells in the current window with rainbow colors
+            for (int offset = 0; offset < trailLength; offset++)
+            {
+                int currentY = y - offset;
+                
+                if (currentY >= 0 && currentY < gridHeight)
+                {
+                    // Get a rainbow color based on position and time
+                    float colorPos = ((float)currentY / gridHeight) + (Time.time * 0.1f);
+                    
+                    // Use rainbow position + offset for the trail
+                    Color rainbowColor = GetEnhancedRainbowColor(colorPos % 1);
+                    
+                    // Fade alpha based on position in trail (head of trail is brightest)
+                    float alpha = 1.0f - ((float)offset / trailLength);
+                    rainbowColor.a = Mathf.Clamp(alpha * 1.5f, 0.1f, 1f);
+                    
+                    UpdateCellWithColor(column, currentY, rainbowColor);
+                }
+            }
+            
+            // Clear cells that are no longer in the effect range
+            if (y - trailLength >= 0 && y - trailLength < gridHeight)
+            {
+                // Use dark gray cell background instead of pure white
+                UpdateCellWithColor(column, y - trailLength, new Color(0.2f, 0.2f, 0.22f));
+            }
+            
+            yield return new WaitForSeconds(0.020f); // Speed up slightly for smoother animation
+        }
+        
+        // Add a small radial shockwave effect at the end
+        StartCoroutine(ShockwaveEffect(column, false));
+        
+        // Now actually clear the column in the grid data
+        for (int y = 0; y < gridHeight; y++)
+        {
+            // Only clear if not already cleared
+            if (grid[column, y] == 1)
+            {
+                grid[column, y] = 0;
+            }
+        }
+    }
+    
+    // New shockwave effect for more visual impact
+    private IEnumerator ShockwaveEffect(int lineIndex, bool isRow)
+    {
+        int maxRadius = 3; // Maximum radius of the shockwave
+        float duration = 0.25f; // Duration of the shockwave
+        
+        for (int radius = 1; radius <= maxRadius; radius++)
+        {
+            // For each radius, light up the cells around the line
+            if (isRow)
+            {
+                // Create a shockwave up and down from the row
+                for (int x = 0; x < gridWidth; x++)
+                {
+                    // Cells above the row
+                    if (lineIndex + radius < gridHeight)
+                    {
+                        Color color = GetEnhancedRainbowColor(((float)x / gridWidth + Time.time * 0.2f) % 1);
+                        color.a = 0.3f * (1f - (float)radius / maxRadius); // Fade with distance
+                        UpdateCellWithColor(x, lineIndex + radius, color);
+                    }
+                    
+                    // Cells below the row
+                    if (lineIndex - radius >= 0)
+                    {
+                        Color color = GetEnhancedRainbowColor(((float)x / gridWidth + Time.time * 0.2f) % 1);
+                        color.a = 0.3f * (1f - (float)radius / maxRadius); // Fade with distance
+                        UpdateCellWithColor(x, lineIndex - radius, color);
+                    }
+                }
+            }
+            else
+            {
+                // Create a shockwave left and right from the column
+                for (int y = 0; y < gridHeight; y++)
+                {
+                    // Cells to the right of the column
+                    if (lineIndex + radius < gridWidth)
+                    {
+                        Color color = GetEnhancedRainbowColor(((float)y / gridHeight + Time.time * 0.2f) % 1);
+                        color.a = 0.3f * (1f - (float)radius / maxRadius); // Fade with distance
+                        UpdateCellWithColor(lineIndex + radius, y, color);
+                    }
+                    
+                    // Cells to the left of the column
+                    if (lineIndex - radius >= 0)
+                    {
+                        Color color = GetEnhancedRainbowColor(((float)y / gridHeight + Time.time * 0.2f) % 1);
+                        color.a = 0.3f * (1f - (float)radius / maxRadius); // Fade with distance
+                        UpdateCellWithColor(lineIndex - radius, y, color);
+                    }
+                }
+            }
+            
+            yield return new WaitForSeconds(duration / maxRadius);
+            
+            // Reset cells for the next radius
+            if (isRow)
+            {
+                for (int x = 0; x < gridWidth; x++)
+                {
+                    if (lineIndex + radius < gridHeight)
+                    {
+                        // Only reset if it's not part of a line being cleared
+                        if (grid[x, lineIndex + radius] == 0)
+                        {
+                            UpdateCellWithColor(x, lineIndex + radius, new Color(0.2f, 0.2f, 0.22f));
+                        }
+                    }
+                    
+                    if (lineIndex - radius >= 0)
+                    {
+                        if (grid[x, lineIndex - radius] == 0)
+                        {
+                            UpdateCellWithColor(x, lineIndex - radius, new Color(0.2f, 0.2f, 0.22f));
+                        }
+                    }
+                }
+            }
+            else
+            {
+                for (int y = 0; y < gridHeight; y++)
+                {
+                    if (lineIndex + radius < gridWidth)
+                    {
+                        if (grid[lineIndex + radius, y] == 0)
+                        {
+                            UpdateCellWithColor(lineIndex + radius, y, new Color(0.2f, 0.2f, 0.22f));
+                        }
+                    }
+                    
+                    if (lineIndex - radius >= 0)
+                    {
+                        if (grid[lineIndex - radius, y] == 0)
+                        {
+                            UpdateCellWithColor(lineIndex - radius, y, new Color(0.2f, 0.2f, 0.22f));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    // Helper method to set cell color for the animation
+    private void UpdateCellWithColor(int x, int y, Color color)
+    {
+        if (gridCells[x, y] != null)
+        {
+            SpriteRenderer renderer = gridCells[x, y].GetComponent<SpriteRenderer>();
+            if (renderer != null)
+            {
+                renderer.color = color;
+            }
+        }
+    }
+    
+    // Enhanced rainbow color generator with more vibrant colors
+    private Color GetEnhancedRainbowColor(float position) 
+    {
+        // Enhanced rainbow with more vibrant colors and better gradient
+        float frequency = 2.0f * Mathf.PI;
+        
+        // Improved color generation with better saturation
+        float r = Mathf.Clamp01(Mathf.Sin(frequency * position + 0) * 0.5f + 0.5f);
+        float g = Mathf.Clamp01(Mathf.Sin(frequency * position + frequency/3) * 0.5f + 0.5f);
+        float b = Mathf.Clamp01(Mathf.Sin(frequency * position + 2*frequency/3) * 0.5f + 0.5f);
+        
+        // Boost saturation
+        float max = Mathf.Max(r, Mathf.Max(g, b));
+        float min = Mathf.Min(r, Mathf.Min(g, b));
+        float delta = max - min;
+        
+        if (delta > 0.1f)
+        {
+            // Increase saturation
+            float luminance = (max + min) / 2f;
+            float satBoost = 1.5f;
+            
+            if (luminance < 0.5f)
+            {
+                // For darker colors, boost carefully
+                r = luminance + (r - luminance) * satBoost;
+                g = luminance + (g - luminance) * satBoost;
+                b = luminance + (b - luminance) * satBoost;
+            }
+            else
+            {
+                // For brighter colors, more aggressive boost
+                float factor = satBoost * 1.2f;
+                r = r * factor - (factor - 1) * luminance;
+                g = g * factor - (factor - 1) * luminance;
+                b = b * factor - (factor - 1) * luminance;
+            }
+        }
+        
+        // Clamp values
+        r = Mathf.Clamp01(r);
+        g = Mathf.Clamp01(g);
+        b = Mathf.Clamp01(b);
+        
+        return new Color(r, g, b, 1f);
+    }
+    
+    public void RemoveBlock(BlockController block)
+    {
+        currentBlocks.Remove(block);
+    }
+    
+    // Helper method to convert world position to grid position
+    public Vector2Int WorldToGridPosition(Vector3 worldPosition)
+    {
+        // Calculate the total dimensions and starting offset (same as in CreateGrid)
+        float totalWidth = gridWidth * cellSize;
+        float totalHeight = gridHeight * cellSize;
+        float startX = -(totalWidth / 2f) + (cellSize / 2f);
+        float startY = -(totalHeight / 2f) + (cellSize / 2f);
+        Vector3 gridOriginOffset = new Vector3(gridOffset.x + startX, gridOffset.y + startY, 0);
+
+        // Position relative to the grid's bottom-left corner (cell 0,0)
+        Vector3 relativePosition = worldPosition - gridOriginOffset;
+
+        // Calculate grid coordinates
+        int x = Mathf.RoundToInt(relativePosition.x / cellSize);
+        int y = Mathf.RoundToInt(relativePosition.y / cellSize);
+        
+        return new Vector2Int(x, y);
+    }
+
+    // New method: Convert grid position to world position
+    public Vector3 GetWorldPositionFromGrid(Vector2Int gridPosition)
+    {
+        // Calculate the total dimensions and starting offset (same as in CreateGrid)
+        float totalWidth = gridWidth * cellSize;
+        float totalHeight = gridHeight * cellSize;
+        float startX = -(totalWidth / 2f) + (cellSize / 2f);
+        float startY = -(totalHeight / 2f) + (cellSize / 2f);
+        Vector3 gridOriginOffset = new Vector3(gridOffset.x + startX, gridOffset.y + startY, 0);
+        
+        // Calculate world position based on grid coordinates
+        Vector3 worldPosition = gridOriginOffset + new Vector3(
+            gridPosition.x * cellSize,
+            gridPosition.y * cellSize,
+            0);
+            
+        return worldPosition;
+    }
+
+    // --- DDA Metric Calculation Methods ---
+
+    private GridMetrics GetGridStateMetrics()
+    {
+        GridMetrics metrics = new GridMetrics();
+
+        metrics.BoardDensity = CalculateBoardDensity();
+        metrics.AvailablePlacements = CalculateAvailablePlacements(availableBlocks); // Check against all potential shapes
+        metrics.MaxPossiblePlacements = CalculateMaxPossiblePlacements(availableBlocks); // Estimate max for normalization
+        metrics.TimeSinceClear = timeSinceLastClear;
+        metrics.IsolatedHoles = CalculateIsolatedHoles();
+        metrics.BoardBumpiness = CalculateBoardBumpiness();
+        metrics.IsAnyFuturePieceUnplaceable = CheckIfAnyPieceUnplaceable(availableBlocks); // Lookahead check
+
+        return metrics;
+    }
+
+    // Calculates total valid placements for a given list of shapes
+    private int CalculateAvailablePlacements(List<BlockShape> shapesToConsider)
+    {
+        int totalPlacements = 0;
+        HashSet<Vector2Int> uniquePlacementPositions = new HashSet<Vector2Int>();
+
+        foreach (BlockShape shape in shapesToConsider)
+        {
+            for (int x = 0; x < gridWidth; x++)
+            {
+                for (int y = 0; y < gridHeight; y++)
+                {
+                    Vector2Int pos = new Vector2Int(x, y);
+                    if (CanPlaceBlock(shape, pos))
+                    {
+                        // Count unique positions OR total valid moves?
+                        // Let's count total valid moves for now.
+                        totalPlacements++;
+                    }
+                }
+            }
+        }
+        return totalPlacements;
+    }
+
+    // Estimate max placements (simple version: assumes empty grid)
+    private int CalculateMaxPossiblePlacements(List<BlockShape> shapesToConsider)
+    {
+         // Crude estimate: average shape size * number of shapes * grid size
+         // Better: Simulate on empty grid (could be cached)
+         int maxPlacements = 0;
+         int[,] emptyGrid = new int[gridWidth, gridHeight]; // Temp empty grid
+         foreach (BlockShape shape in shapesToConsider)
+         {
+             for (int x = 0; x < gridWidth; x++)
+             {
+                 for (int y = 0; y < gridHeight; y++)
+                 {
+                    // Need a CanPlaceBlock that takes a grid parameter
+                    // Or just check bounds for empty grid simulation
+                     bool fits = true;
+                     foreach (Vector2Int cell in shape.cells)
+                     {
+                         Vector2Int gridPos = new Vector2Int(x, y) + cell;
+                         if (gridPos.x < 0 || gridPos.x >= gridWidth || gridPos.y < 0 || gridPos.y >= gridHeight)
+                         {
+                             fits = false; break;
+                         }
+                     }
+                     if (fits) maxPlacements++;
+                 }
+             }
+         }
+         return maxPlacements > 0 ? maxPlacements : 1; // Avoid division by zero
+    }
+
+    // Counts empty cells surrounded by filled cells
+    private int CalculateIsolatedHoles()
+    {
+        int holeCount = 0;
+        for (int x = 0; x < gridWidth; x++)
+        {
+            for (int y = 0; y < gridHeight; y++)
+            {
+                if (grid[x, y] == 0) // If cell is empty
+                {
+                    bool surrounded = true;
+                    // Check 4 neighbours (or 8 if diagonal matters)
+                    int[] dx = { 0, 0, 1, -1 };
+                    int[] dy = { 1, -1, 0, 0 };
+                    for (int i = 0; i < 4; i++)
+                    {
+                        int nx = x + dx[i];
+                        int ny = y + dy[i];
+                        // If neighbour is within bounds AND is empty, it's not a hole
+                        if (nx >= 0 && nx < gridWidth && ny >= 0 && ny < gridHeight && grid[nx, ny] == 0)
+                        {
+                            surrounded = false;
+                            break;
+                        }
+                        // If neighbour is out of bounds, consider it 'filled' for hole detection
+                    }
+                    if (surrounded) { holeCount++; }
+                }
+            }
+        }
+        return holeCount;
+    }
+
+    // Calculates sum of height differences between adjacent columns
+    private float CalculateBoardBumpiness()
+    {
+        float totalBumpiness = 0;
+        int[] columnHeights = new int[gridWidth];
+
+        // Calculate height of each column (highest filled cell)
+        for (int x = 0; x < gridWidth; x++)
+        {
+            int height = 0;
+            for (int y = 0; y < gridHeight; y++)
+            {
+                if (grid[x, y] == 1)
+                {
+                    height = y + 1; // Use 1-based height
+                }
+            }
+            columnHeights[x] = height;
+        }
+
+        // Sum absolute differences between adjacent column heights
+        for (int x = 0; x < gridWidth - 1; x++)
+        {
+            totalBumpiness += Mathf.Abs(columnHeights[x] - columnHeights[x + 1]);
+        }
+
+        return totalBumpiness;
+    }
+
+    // Checks if *any* of the potential shapes cannot be placed anywhere
+    private bool CheckIfAnyPieceUnplaceable(List<BlockShape> shapesToConsider)
+    {
+        foreach (BlockShape shape in shapesToConsider)
+        {
+            if (!IsShapePlaceableAnywhere(shape))
+            {
+                 Debug.LogWarning($"Lookahead: Shape '{shape.shapeName}' is unplaceable on current board.");
+                 return true; // Found at least one unplaceable shape
+            }
+        }
+        return false; // All considered shapes are placeable
+    }
+
+    // Method to check which lines would be completed if cells are placed
+    public List<List<Vector2Int>> GetPotentialLineCompletions(List<Vector2Int> cellsToPlace)
+    {
+        List<List<Vector2Int>> completedLines = new List<List<Vector2Int>>();
+        
+        // Create a temporary copy of the grid
+        int[,] tempGrid = (int[,])grid.Clone();
+        
+        // Simulate placing the cells
+        foreach (Vector2Int cell in cellsToPlace)
+        {
+            if (cell.x >= 0 && cell.x < gridWidth && cell.y >= 0 && cell.y < gridHeight)
+            {
+                tempGrid[cell.x, cell.y] = 1;
+            }
+        }
+        
+        // Check rows for completion
+        for (int y = 0; y < gridHeight; y++)
+        {
+            bool rowComplete = true;
+            for (int x = 0; x < gridWidth; x++)
+            {
+                if (tempGrid[x, y] == 0)
+                {
+                    rowComplete = false;
+                    break;
+                }
+            }
+            
+            if (rowComplete)
+            {
+                // This row would be completed, add all cells in this row
+                List<Vector2Int> completedRow = new List<Vector2Int>();
+                for (int x = 0; x < gridWidth; x++)
+                {
+                    completedRow.Add(new Vector2Int(x, y));
+                }
+                completedLines.Add(completedRow);
+            }
+        }
+        
+        // Check columns for completion
+        for (int x = 0; x < gridWidth; x++)
+        {
+            bool columnComplete = true;
+            for (int y = 0; y < gridHeight; y++)
+            {
+                if (tempGrid[x, y] == 0)
+                {
+                    columnComplete = false;
+                    break;
+                }
+            }
+            
+            if (columnComplete)
+            {
+                // This column would be completed, add all cells in this column
+                List<Vector2Int> completedColumn = new List<Vector2Int>();
+                for (int y = 0; y < gridHeight; y++)
+                {
+                    completedColumn.Add(new Vector2Int(x, y));
+                }
+                completedLines.Add(completedColumn);
+            }
+        }
+        
+        return completedLines;
+    }
+
+    // Helper method to shuffle the blocks list for more variety in game starts
+    private void ShuffleBlocksList()
+    {
+        // Fisher-Yates shuffle algorithm
+        for (int i = availableBlocks.Count - 1; i > 0; i--)
+        {
+            int j = Random.Range(0, i + 1);
+            // Swap blocks[i] and blocks[j]
+            BlockShape temp = availableBlocks[i];
+            availableBlocks[i] = availableBlocks[j];
+            availableBlocks[j] = temp;
+        }
+        Debug.Log("Shuffled available blocks for more randomized game starts");
+    }
+
+    // New method to show streak visual effects
+    private void ShowStreakVFX(Vector2Int position, int linesCleared)
+    {
+        if (streakTextPrefab == null) return;
+        
+        // Get world position of the placed block
+        Vector3 worldPos = GetWorldPositionFromGrid(position);
+        worldPos.y += 1.0f; // Offset upward so text appears above the block
+        
+        // Create streak text object
+        GameObject streakObj = Instantiate(streakTextPrefab, worldPos, Quaternion.identity);
+        
+        // Get text component
+        TMPro.TextMeshPro textMesh = streakObj.GetComponent<TMPro.TextMeshPro>();
+        if (textMesh != null)
+        {
+            // Format streak message
+            string streakText = $"Streak x{currentStreak}!";
+            
+            // Add line count if multiple lines cleared
+            if (linesCleared > 1)
+            {
+                streakText = $"{linesCleared} LINES!\n{streakText}";
+            }
+            
+            textMesh.text = streakText;
+            
+            // Set color based on streak level
+            if (streakColors != null && streakColors.Length > 0)
+            {
+                // Map streak to color array index (clamped to array size)
+                int colorIndex = Mathf.Min(currentStreak - 2, streakColors.Length - 1);
+                if (colorIndex >= 0)
+                {
+                    textMesh.color = streakColors[colorIndex];
+                }
+            }
+            
+            // Scale text based on streak level (bigger text for higher streaks)
+            float scale = Mathf.Min(1.0f + (currentStreak - 1) * 0.1f, 2.0f);
+            streakObj.transform.localScale = new Vector3(scale, scale, scale);
+        }
+        
+        // Also show line completion VFX if available and multiple lines cleared
+        if (lineCompletionVFXPrefab != null && linesCleared > 1)
+        {
+            GameObject vfx = Instantiate(lineCompletionVFXPrefab, worldPos, Quaternion.identity);
+            
+            // Scale particle effect based on lines cleared
+            ParticleSystem particles = vfx.GetComponent<ParticleSystem>();
+            if (particles != null)
+            {
+                var main = particles.main;
+                main.startSize = main.startSize.constant * Mathf.Min(1.0f + (linesCleared - 1) * 0.3f, 2.5f);
+            }
+            
+            // Destroy after a few seconds
+            Destroy(vfx, 2.0f);
+        }
+        
+        // Animate and destroy the streak text
+        StartCoroutine(AnimateStreakText(streakObj));
+    }
+    
+    // Animate streak text floating upward and fading out
+    private IEnumerator AnimateStreakText(GameObject streakObj)
+    {
+        if (streakObj == null) yield break;
+        
+        float duration = 1.5f;
+        float elapsed = 0f;
+        
+        Vector3 startPos = streakObj.transform.position;
+        Vector3 endPos = startPos + new Vector3(0, 2.0f, 0); // Float upward
+        
+        TMPro.TextMeshPro textMesh = streakObj.GetComponent<TMPro.TextMeshPro>();
+        Color startColor = textMesh.color;
+        Color endColor = new Color(startColor.r, startColor.g, startColor.b, 0); // Fade to transparent
+        
+        while (elapsed < duration)
+        {
+            elapsed += Time.deltaTime;
+            float progress = elapsed / duration;
+            
+            // Ease out for position (move quickly at first, then slow)
+            float positionCurve = 1 - Mathf.Pow(1 - progress, 3);
+            
+            // Fade out only in the second half
+            float fadeCurve = progress < 0.5f ? 1 : 1 - ((progress - 0.5f) * 2);
+            
+            // Update position and color
+            streakObj.transform.position = Vector3.Lerp(startPos, endPos, positionCurve);
+            
+            if (textMesh != null)
+            {
+                textMesh.color = Color.Lerp(startColor, endColor, 1 - fadeCurve);
+            }
+            
+            yield return null;
+        }
+        
+        Destroy(streakObj);
+    }
+
+    // Show hints for where blocks can be placed
+    private void ShowPlacementHint()
+    {
+        // Don't show hints if disabled or already showing
+        if (!enableHints || isShowingHint) return;
+        
+        // Clean up any existing hint indicators
+        HideAllHints();
+        
+        isShowingHint = true;
+        consecutiveHintCount++;
+        timeSinceLastHint = 0f;
+        
+        Debug.Log($"Showing placement hint (consecutive: {consecutiveHintCount})");
+        
+        // Find a good candidate block and position
+        BlockController bestBlockToHint = null;
+        Vector2Int bestPosition = Vector2Int.zero;
+        int bestScore = -1;
+        
+        // Evaluate each available block for hint potential
+        foreach (BlockController block in currentBlocks)
+        {
+            if (block == null || block.shape == null) continue;
+            
+            // Scan the grid for the best placement for this block
+            for (int x = 0; x < gridWidth; x++)
+            {
+                for (int y = 0; y < gridHeight; y++)
+                {
+                    Vector2Int pos = new Vector2Int(x, y);
+                    if (CanPlaceBlock(block.shape, pos))
+                    {
+                        // Score this placement
+                        int clearCount = SimulatePlacementAndCheckClears(block.shape, pos);
+                        
+                        // Higher score for placements that clear lines
+                        int placementScore = clearCount * 100;
+                        
+                        // Add bonus for blocks that fit nicely (near other blocks)
+                        int adjacencyScore = EvaluateAdjacencyScore(block.shape, pos);
+                        placementScore += adjacencyScore;
+                        
+                        // If this is better than our current best, update
+                        if (placementScore > bestScore)
+                        {
+                            bestScore = placementScore;
+                            bestBlockToHint = block;
+                            bestPosition = pos;
+                        }
+                    }
+                }
+            }
+        }
+        
+        // If we found a good placement, show hint
+        if (bestBlockToHint != null && bestScore > 0)
+        {
+            activeHintCoroutine = StartCoroutine(AnimateHint(bestBlockToHint, bestPosition));
+        }
+        else
+        {
+            // No good hint found
+            isShowingHint = false;
+        }
+    }
+    
+    // Evaluate how good a placement is based on adjacency to existing blocks
+    private int EvaluateAdjacencyScore(BlockShape shape, Vector2Int position)
+    {
+        int adjacencyScore = 0;
+        
+        foreach (Vector2Int cell in shape.cells)
+        {
+            Vector2Int gridPos = position + cell;
+            
+            // Check all 4 adjacent cells
+            Vector2Int[] adjacentDirections = new Vector2Int[]
+            {
+                new Vector2Int(1, 0),
+                new Vector2Int(-1, 0),
+                new Vector2Int(0, 1),
+                new Vector2Int(0, -1)
+            };
+            
+            foreach (Vector2Int dir in adjacentDirections)
+            {
+                Vector2Int adjacentPos = gridPos + dir;
+                
+                // If the adjacent position is within grid bounds and filled
+                if (adjacentPos.x >= 0 && adjacentPos.x < gridWidth &&
+                    adjacentPos.y >= 0 && adjacentPos.y < gridHeight &&
+                    grid[adjacentPos.x, adjacentPos.y] == 1)
+                {
+                    adjacencyScore += 5; // Points for each adjacent filled cell
+                }
+            }
+            
+            // Extra points for surrounding empty cells that would be filled
+            // This helps suggest blocks that fill hard-to-reach spots
+            if (IsHardToReachCell(gridPos))
+            {
+                adjacencyScore += 15;
+            }
+        }
+        
+        return adjacencyScore;
+    }
+    
+    // Check if a cell is "hard to reach" (has filled cells around it)
+    private bool IsHardToReachCell(Vector2Int pos)
+    {
+        // Skip if out of bounds
+        if (pos.x < 0 || pos.x >= gridWidth || pos.y < 0 || pos.y >= gridHeight)
+            return false;
+            
+        // Skip if already filled
+        if (grid[pos.x, pos.y] == 1)
+            return false;
+            
+        // Count filled neighbors
+        int filledNeighbors = 0;
+        int totalNeighbors = 0;
+        
+        // Check all 8 surrounding cells
+        for (int dx = -1; dx <= 1; dx++)
+        {
+            for (int dy = -1; dy <= 1; dy++)
+            {
+                if (dx == 0 && dy == 0) continue; // Skip center cell
+                
+                Vector2Int neighbor = new Vector2Int(pos.x + dx, pos.y + dy);
+                
+                if (neighbor.x >= 0 && neighbor.x < gridWidth &&
+                    neighbor.y >= 0 && neighbor.y < gridHeight)
+                {
+                    totalNeighbors++;
+                    if (grid[neighbor.x, neighbor.y] == 1)
+                    {
+                        filledNeighbors++;
+                    }
+                }
+            }
+        }
+        
+        // Hard to reach if high percentage of neighbors are filled
+        return totalNeighbors > 0 && (float)filledNeighbors / totalNeighbors > 0.5f;
+    }
+    
+    // Animate hint indicators pulsing on the grid
+    private IEnumerator AnimateHint(BlockController block, Vector2Int position)
+    {
+        // Create hint indicators for each cell of the block
+        foreach (Vector2Int cell in block.shape.cells)
+        {
+            Vector2Int gridPos = position + cell;
+            
+            // Skip cells outside the grid
+            if (gridPos.x < 0 || gridPos.x >= gridWidth ||
+                gridPos.y < 0 || gridPos.y >= gridHeight)
+                continue;
+                
+            // Create hint indicator
+            if (hintIndicatorPrefab != null)
+            {
+                GameObject indicator = Instantiate(hintIndicatorPrefab, transform);
+                Vector3 worldPos = GetWorldPositionFromGrid(gridPos);
+                indicator.transform.position = worldPos;
+                
+                // Set color to match the block's color but semi-transparent
+                SpriteRenderer renderer = indicator.GetComponent<SpriteRenderer>();
+                if (renderer != null && block.shape != null)
+                {
+                    Color hintColor = block.shape.blockColor;
+                    hintColor.a = 0.7f;
+                    renderer.color = hintColor;
+                }
+                
+                activeHintIndicators.Add(indicator);
+            }
+        }
+        
+        // Pulse animation
+        float elapsedTime = 0f;
+        while (elapsedTime < hintPulseDuration)
+        {
+            elapsedTime += Time.deltaTime;
+            float pulseProgress = elapsedTime / hintPulseDuration;
+            
+            // Sine wave for smooth pulse
+            float pulse = 0.7f + 0.3f * Mathf.Sin(pulseProgress * Mathf.PI * 4);
+            
+            // Apply pulse to each indicator
+            foreach (GameObject indicator in activeHintIndicators)
+            {
+                if (indicator != null)
+                {
+                    indicator.transform.localScale = Vector3.one * pulse;
+                    
+                    // Also pulse the alpha
+                    SpriteRenderer renderer = indicator.GetComponent<SpriteRenderer>();
+                    if (renderer != null)
+                    {
+                        Color color = renderer.color;
+                        color.a = 0.4f + 0.3f * Mathf.Sin(pulseProgress * Mathf.PI * 4);
+                        renderer.color = color;
+                    }
+                }
+            }
+            
+            yield return null;
+        }
+        
+        // Clean up indicators
+        HideAllHints();
+    }
+    
+    // Hide all active hint indicators
+    private void HideAllHints()
+    {
+        if (activeHintCoroutine != null)
+        {
+            StopCoroutine(activeHintCoroutine);
+            activeHintCoroutine = null;
+        }
+        
+        foreach (GameObject indicator in activeHintIndicators)
+        {
+            if (indicator != null)
+            {
+                Destroy(indicator);
+            }
+        }
+        
+        activeHintIndicators.Clear();
+        isShowingHint = false;
+    }
+} 
+
+
+
