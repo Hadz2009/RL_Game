@@ -2249,87 +2249,7 @@ public class GridManager : MonoBehaviour
     /// Places it in the next available dock slot.
     /// </summary>
     /// <param name="blockPrefabToSpawn">The specific block prefab chosen by the Agent.</param>
-    public void SpawnSpecificBlock(GameObject blockPrefabToSpawn)
-    {
-        if (blockPrefabToSpawn == null)
-        {
-            //Debug.LogError("Agent provided a null block prefab to spawn!", this);
-            return;
-        }
-
-        // Try to get BlockShape component (assuming prefab has it or its child does)
-        BlockShape blockShape = blockPrefabToSpawn.GetComponentInChildren<BlockShape>();
-        if (blockShape == null)
-        {
-             // Maybe the prefab *is* the shape? Check root.
-             blockShape = blockPrefabToSpawn.GetComponent<BlockShape>();
-             if (blockShape == null)
-             {
-                //Debug.LogError($"Provided block prefab '{blockPrefabToSpawn.name}' does not contain a BlockShape component!", this);
-                return;
-             }
-        }
-         ////Debug.log($"Agent requested spawning block with shape: {blockShape.shapeName}");
-
-        // If we have 3 blocks already, maybe replace one? Or just don't spawn?
-        // For now, let's just not spawn if the dock is full. Agent needs to handle this.
-        if (currentBlocks.Count >= 3)
-        {
-             //Debug.LogWarning("Agent tried to spawn a block, but dock is full (3 blocks). Ignoring request.", this);
-             // Optionally provide negative reward here?
-             return;
-        }
-
-
-        // Calculate LOCAL spawn position (spread blocks horizontally) - MATCH normal SpawnBlock logic
-        float spacing = dockBlockSpacing;
-        float xPosition = blockSpawnArea.x + (currentBlocks.Count) * spacing;
-        Vector3 localSpawnPosition = new Vector3(xPosition, blockSpawnArea.y, 0); // This is relative to blocksContainer
-
-        // Instantiate without specific world position/rotation yet - MATCH normal SpawnBlock logic
-        GameObject blockObj = Instantiate(blockPrefabToSpawn);
-
-        if (blocksContainer != null) 
-        {
-            blockObj.transform.SetParent(blocksContainer);
-            blockObj.transform.localPosition = localSpawnPosition;
-            blockObj.transform.localRotation = Quaternion.identity; // Ensure consistent local rotation
-        }
-        else
-        {
-            // Fallback: if blocksContainer isn't assigned, parent to GridManager's transform
-            //Debug.LogWarning("blocksContainer is not assigned in GridManager. Spawning block relative to GridManager's root. Consider assigning blocksContainer as a child of GridManager.");
-            blockObj.transform.SetParent(transform); // Parent to the GridManager itself
-            blockObj.transform.localPosition = localSpawnPosition;
-            blockObj.transform.localRotation = Quaternion.identity;
-        }
-
-        blockObj.transform.localScale = initialBlockScale;
-
-        BlockController controller = blockObj.GetComponent<BlockController>();
-        if (controller == null)
-        {
-            //Debug.LogError($"BlockController component not found on the provided agent block prefab '{blockPrefabToSpawn.name}'!", this);
-            Destroy(blockObj);
-            return;
-        }
-
-        // Initialize the controller with the shape derived from the prefab
-        controller.Initialize(blockShape, this);
-        currentBlocks.Add(controller);
-
-        // We might need to add the shape to availableBlocks if it's not there?
-        // This assumes the agent only picks from shapes already in availableBlocks.
-        if (!availableBlocks.Any(b => b.shapeName == blockShape.shapeName))
-        {
-             //Debug.LogWarning($"Agent spawned shape '{blockShape.shapeName}' which was not in the initial availableBlocks list.", this);
-             // Add it dynamically? Might mess up DDA logic if we switch back.
-             // availableBlocks.Add(blockShape);
-        }
-
-
-        ////Debug.log($"Specific block '{blockShape.shapeName}' spawned by Agent request. Total blocks: {currentBlocks.Count}");
-    }
+    
 
     /// <summary>
     /// Checks if the game is over. Game over occurs if there are blocks in the dock,
@@ -2383,7 +2303,7 @@ public class GridManager : MonoBehaviour
     /// <param name="shape">The BlockShape to use for this block.</param>
     public void SpawnSpecificBlock(BlockShape shape)
     {
-        Debug.Log($"SpawnSpecificBlock called with shape: {(shape?.shapeName ?? "NULL")}");
+        //Debug.Log($"SpawnSpecificBlock called with shape: {(shape?.shapeName ?? "NULL")}");
         
         if (shape == null)
         {
@@ -2391,19 +2311,19 @@ public class GridManager : MonoBehaviour
             return;
         }
 
-        Debug.Log($"SpawnSpecificBlock: Current blocks count before spawn: {currentBlocks.Count}");
+       // Debug.Log($"SpawnSpecificBlock: Current blocks count before spawn: {currentBlocks.Count}");
         
         // If we have 3 blocks already, don't spawn
         if (currentBlocks.Count >= 3)
         {
-            Debug.LogWarning("Agent tried to spawn a block, but dock is full (3 blocks). Ignoring request.", this);
+        //    Debug.LogWarning("Agent tried to spawn a block, but dock is full (3 blocks). Ignoring request.", this);
             return;
         }
 
         // Make sure we have a block prefab
         if (blockPrefab == null)
         {
-            Debug.LogError("BlockPrefab is not assigned in GridManager! Cannot spawn block.", this);
+           // Debug.LogError("BlockPrefab is not assigned in GridManager! Cannot spawn block.", this);
             return;
         }
 
@@ -2437,104 +2357,26 @@ public class GridManager : MonoBehaviour
         BlockController controller = blockObj.GetComponent<BlockController>();
         if (controller == null)
         {
-            Debug.LogError("BlockController component not found on blockPrefab!", this);
+           // Debug.LogError("BlockController component not found on blockPrefab!", this);
             Destroy(blockObj);
             return;
         }
 
-        Debug.Log($"SpawnSpecificBlock: Found BlockController, initializing with shape '{shape.shapeName}'");
+        //Debug.Log($"SpawnSpecificBlock: Found BlockController, initializing with shape '{shape.shapeName}'");
 
         // Initialize with the provided shape
         controller.Initialize(shape, this);
         
-        Debug.Log($"SpawnSpecificBlock: About to add controller to currentBlocks. Count before: {currentBlocks.Count}");
+       // Debug.Log($"SpawnSpecificBlock: About to add controller to currentBlocks. Count before: {currentBlocks.Count}");
         currentBlocks.Add(controller);
-        Debug.Log($"SpawnSpecificBlock: Successfully spawned '{shape.shapeName}'. Total blocks: {currentBlocks.Count}");
+      //  Debug.Log($"SpawnSpecificBlock: Successfully spawned '{shape.shapeName}'. Total blocks: {currentBlocks.Count}");
     }
 
     /// <summary>
     /// An additional overload that takes both a prefab and a shape. 
     /// Useful when you want to use a specific prefab with a specific shape.
     /// </summary>
-    public void SpawnSpecificBlock(GameObject prefab, BlockShape shape)
-    {
-        // Use default prefab if none provided
-        if (prefab == null)
-        {
-            if (blockPrefab == null)
-            {
-                //Debug.LogError("No prefab provided and default blockPrefab is null. Cannot spawn block!", this);
-                return;
-            }
-            SpawnSpecificBlock(shape);
-            return;
-        }
-
-        // If shape is null, try to get it from the prefab
-        if (shape == null)
-        {
-            shape = prefab.GetComponentInChildren<BlockShape>();
-            if (shape == null)
-            {
-                shape = prefab.GetComponent<BlockShape>();
-                if (shape == null)
-                {
-                    //Debug.LogError("Neither a BlockShape was provided nor could one be found on the prefab!", this);
-                    return;
-                }
-            }
-            SpawnSpecificBlock(prefab); // Use the original method with just the prefab
-            return;
-        }
-
-        // Both prefab and shape provided - use the prefab but with the specified shape
-        if (currentBlocks.Count >= 3)
-        {
-            //Debug.LogWarning("Agent tried to spawn a block, but dock is full (3 blocks). Ignoring request.", this);
-            return;
-        }
-
-        ////Debug.log($"Agent requested spawning block with prefab and shape: {shape.shapeName}");
-
-        // Calculate LOCAL spawn position (spread blocks horizontally) - MATCH normal SpawnBlock logic
-        float spacing = dockBlockSpacing;
-        float xPosition = blockSpawnArea.x + (currentBlocks.Count) * spacing;
-        Vector3 localSpawnPosition = new Vector3(xPosition, blockSpawnArea.y, 0); // This is relative to blocksContainer
-
-        // Instantiate without specific world position/rotation yet - MATCH normal SpawnBlock logic
-        GameObject blockObj = Instantiate(prefab);
-
-        if (blocksContainer != null) 
-        {
-            blockObj.transform.SetParent(blocksContainer);
-            blockObj.transform.localPosition = localSpawnPosition;
-            blockObj.transform.localRotation = Quaternion.identity; // Ensure consistent local rotation
-        }
-        else
-        {
-            // Fallback: if blocksContainer isn't assigned, parent to GridManager's transform
-            //Debug.LogWarning("blocksContainer is not assigned in GridManager. Spawning block relative to GridManager's root. Consider assigning blocksContainer as a child of GridManager.");
-            blockObj.transform.SetParent(transform); // Parent to the GridManager itself
-            blockObj.transform.localPosition = localSpawnPosition;
-            blockObj.transform.localRotation = Quaternion.identity;
-        }
-
-        blockObj.transform.localScale = initialBlockScale;
-
-        BlockController controller = blockObj.GetComponent<BlockController>();
-        if (controller == null)
-        {
-            //Debug.LogError("BlockController component not found on provided prefab!", this);
-            Destroy(blockObj);
-            return;
-        }
-
-        // Initialize with the provided shape
-        controller.Initialize(shape, this);
-        currentBlocks.Add(controller);
-
-        Debug.Log($"SpawnSpecificBlock (prefab): Successfully spawned '{shape.shapeName}'. Total blocks: {currentBlocks.Count}");
-    }
+   
 
     // --- End ML-Agent Public Methods ---
 

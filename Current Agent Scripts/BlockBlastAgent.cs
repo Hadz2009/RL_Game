@@ -16,6 +16,7 @@ public class BlockBlastAgent : Agent
     [Header("References")]
     [SerializeField] private GridManager gridManager;
     [SerializeField] private GameManager gameManager;
+    [SerializeField] private BlockProviderAgent blockProviderAgent;
 
     [Header("Agent Settings")]
     [SerializeField] private int maxStepsPerEpisode = 2000;
@@ -78,7 +79,7 @@ public class BlockBlastAgent : Agent
 
     public override void OnEpisodeBegin()
     {
-        Debug.Log(currentStep);
+        //Debug.Log(currentStep);
         currentStep = 0;
         isActionInProgress = false;
         StopAllCoroutines();
@@ -96,9 +97,7 @@ public class BlockBlastAgent : Agent
         compactnessReward = 0f;
 
         gameManager?.ResetScore();
-        gridManager.ClearGrid();
-        gridManager.SpawnBlocks(NumDockSlots);
-        PrecomputeValidPlacements();
+        
     }
 
     private void Update()
@@ -108,9 +107,16 @@ public class BlockBlastAgent : Agent
             if (gridManager.CheckGameOver())
             {
                 AddReward(gameOverPenalty * scaleFactor);
-                EndEpisode();
+                //EndEpisode();
 			}
         }
+    }
+
+
+    public void OnNewBlocksProvided()
+    {
+        PrecomputeValidPlacements();
+        RequestDecision();  
     }
 
     /// <summary>
@@ -186,6 +192,7 @@ public class BlockBlastAgent : Agent
 
     public override void WriteDiscreteActionMask(IDiscreteActionMask mask)
     {
+        // Always recompute valid placements right before masking to ensure synchronization
         PrecomputeValidPlacements();
         int gridCells = gridManager.gridWidth * gridManager.gridHeight;
         int totalActions = NumBlocks * gridCells;
@@ -220,16 +227,22 @@ public class BlockBlastAgent : Agent
             mask.SetActionEnabled(0, 0, true);
             Debug.LogWarning("Masking bug: no valid actions, unmasking 0");
         }
+        
+        // Debug log to track action masking timing
+        //Debug.Log($"Action mask computed with {validPlacementsByBlockIndex.Sum(kvp => kvp.Value.Count)} total valid placements");
     }
 
     public override void OnActionReceived(ActionBuffers actions)
     {
         if (isActionInProgress) return;
-        if (gridManager.isClearingLines)
+        if (gridManager.isClearingLines || gridManager.currentBlocks.Count == 0)
         {
             //currentStep++;
             return;
         }
+
+        // Ensure our placement cache is up-to-date before processing the action
+        PrecomputeValidPlacements();
 
         int action = actions.DiscreteActions[0];
         DecodeAction(action, out int blockIdx, out int x, out int y);
@@ -247,14 +260,24 @@ public class BlockBlastAgent : Agent
             return;
         }
 
+        if (blockIdx >= gridManager.currentBlocks.Count || gridManager.currentBlocks[blockIdx] == null)
+        {
+            // The block is gone. This was a stale action. Ignore it and do nothing.
+            RequestDecision();
+            return; 
+        }
+        
         BlockController block = gridManager.currentBlocks[blockIdx];
         BlockShape shape = block.shape;
         Vector2Int pos = new Vector2Int(x, y);
 
         if (!gridManager.CanPlaceBlock(shape, pos))
         {
-            Debug.LogError($"CanPlaceBlock false for slot {blockIdx} at {pos}");
-            EndEpisode();
+            Debug.LogWarning($"Action masking desync: Block {blockIdx} cannot be placed at {pos}. Requesting new decision.");
+            // This is likely a timing issue - the action mask was computed when this was valid,
+            // but by the time we got here, the game state changed. Just request a new decision.
+            PrecomputeValidPlacements();
+            RequestDecision();
             return;
         }
 
@@ -343,34 +366,73 @@ public class BlockBlastAgent : Agent
 
         gridManager.RemoveBlock(blockToPlace);
 
-        if (gridManager.currentBlocks.Count == 0)
-        {
-            if (actionDelaySeconds > 0.001f)
-                yield return new WaitForSeconds(actionDelaySeconds);
+       // This is the NEW code for your BlockBlastAgent.cs
 
-            gridManager.SpawnBlocks(NumDockSlots);
-        }
-        else if (actionDelaySeconds > 0.001f)
+      // --- 2. WAIT FOR ANY VISUALS TO FINISH ---
+        // This ensures the game state is stable before we make a new decision.
+        if (actionDelaySeconds > 0.001f)
         {
             yield return new WaitForSeconds(actionDelaySeconds);
         }
 
-        PrecomputeValidPlacements();
+        // --- 3. THE NEW, CORRECTED DECISION LOGIC ---
+        // The previous action is 100% complete. Now we decide what to do next.
         isActionInProgress = false;
 
+        // Check if the dock is now empty.
+        if (gridManager.currentBlocks.Count == 0)
+        {
+            // The dock is empty. We need new blocks.
+            // Check our toggle to see WHO should provide them.
+            if (gameManager != null && gameManager.useBlockProviderAgent)
+            {
+                // --- A) NEW AI LOGIC ---
+                // Tell the BlockProviderAgent to run its analysis and provide new blocks.
+                if (blockProviderAgent != null)
+                {
+                    //Debug.Log("Requesting new blocks from BlockProviderAgent");
+                    blockProviderAgent.RequestNewBlocks();
+                }
+            }
+            else
+            {
+                // --- B) OLD DDA LOGIC ---
+                // The toggle is off, so use the original GridManager spawning logic.
+                gridManager.SpawnBlocks(3);
+                PrecomputeValidPlacements(); // We need to precompute for the new blocks
+                RequestDecision(); // Tell this agent to think about its next move
+            }
+        }
+        else
+        {
+            // The dock is NOT empty. It's still this agent's turn.
+            // It needs to decide which of the remaining blocks to place next.
+            PrecomputeValidPlacements();
+            RequestDecision();
+        }
+       
         Academy.Instance.StatsRecorder.Add("Custom/GlobalStep", 1f, StatAggregationMethod.Average);
         CheckForGameOverAndEndEpisode();
     }
 
+    // In BlockBlastAgent.cs
+    // In BlockBlastAgent.cs, REPLACE the content of this method
     private void CheckForGameOverAndEndEpisode()
     {
-        if (gridManager.CheckGameOver())
+        // The player agent's job is to check if it's stuck with its current blocks.
+        bool hasValidMove = validPlacementsByBlockIndex.Values.Any(placements => placements != null && placements.Count > 0);
+
+        // The game is over if there are blocks in the dock, but none of them have a valid move.
+        if (!hasValidMove && gridManager.currentBlocks.Count > 0)
         {
-            bool hasValidMove = validPlacementsByBlockIndex.Values.Any(placements => placements != null && placements.Count > 0);
-            if (!hasValidMove)
-            {
-                AddReward(gameOverPenalty * scaleFactor);
-                EndEpisode();
+            // We are stuck. Instead of ending the episode itself,
+            // we tell the BlockProviderAgent that the game is over.
+            if (blockProviderAgent != null)
+            {   
+                //Debug.Log(currentStep);
+                currentStep = 0;
+               // Debug.Log("Telling BlockProviderAgent that the game is over");
+                blockProviderAgent.PlayerIsStuckAndGameIsOver();
             }
         }
     }

@@ -7,6 +7,10 @@ public class GameManager : MonoBehaviour
     [SerializeField] private GridManager gridManager;
     [SerializeField] private UIManager uiManager;
 
+    [Header("AI Agent Control")]
+    [Tooltip("Check this to use the new BlockProviderAgent. Uncheck to use the old GridManager DDA.")]
+    public bool useBlockProviderAgent = true; // <-- ADD THIS LINE
+
     public bool IsAgentTrainingMode = false;
     public bool useRandomBlockSpawningEqualWeights = false;
     private int score = 0;
