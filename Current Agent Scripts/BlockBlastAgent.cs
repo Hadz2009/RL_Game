@@ -115,8 +115,31 @@ public class BlockBlastAgent : Agent
 
     public void OnNewBlocksProvided()
     {
+        // FIXED: Only precompute placements, don't immediately request a decision
+        // The decision will be requested naturally when the agent is ready
         PrecomputeValidPlacements();
-        RequestDecision();  
+        
+        // Check if manual play is enabled via BlockProviderAgent
+        bool manualPlayEnabled = blockProviderAgent != null && blockProviderAgent.enableManualPlay;
+        
+        // Only request a decision if manual play is disabled and other conditions are met
+        if (!manualPlayEnabled && 
+            !isActionInProgress && 
+            gridManager.currentBlocks != null && 
+            gridManager.currentBlocks.Count > 0 &&
+            validPlacementsByBlockIndex.Values.Any(placements => placements != null && placements.Count > 0))
+        {
+            RequestDecision();
+        }
+        else if (gridManager.currentBlocks.Count == 0)
+        {
+            Debug.LogWarning("OnNewBlocksProvided called but no blocks are available");
+        }
+        else if (!validPlacementsByBlockIndex.Values.Any(placements => placements != null && placements.Count > 0))
+        {
+            Debug.LogWarning("OnNewBlocksProvided called but no valid placements available - game should end");
+            CheckForGameOverAndEndEpisode();
+        }
     }
 
     /// <summary>
@@ -198,6 +221,13 @@ public class BlockBlastAgent : Agent
         int totalActions = NumBlocks * gridCells;
         bool hasValidAction = false;
 
+        // If there are no blocks in the dock, don't mask anything yet - we're waiting for blocks
+        if (gridManager.currentBlocks == null || gridManager.currentBlocks.Count == 0)
+        {
+            // Don't mask anything - just wait for blocks to be provided
+            return;
+        }
+
         for (int i = 0; i < totalActions; i++)
         {
             int blockIdx = i / gridCells;
@@ -206,7 +236,9 @@ public class BlockBlastAgent : Agent
             int y = remainder / gridManager.gridWidth;
             bool valid = false;
 
-            if (blockIdx < gridManager.currentBlocks.Count && validPlacementsByBlockIndex.TryGetValue(blockIdx, out var placements))
+            if (blockIdx < gridManager.currentBlocks.Count && 
+                gridManager.currentBlocks[blockIdx] != null &&
+                validPlacementsByBlockIndex.TryGetValue(blockIdx, out var placements))
             {
                 foreach (var pos in placements)
                 {
@@ -224,8 +256,9 @@ public class BlockBlastAgent : Agent
 
         if (!hasValidAction)
         {
-            mask.SetActionEnabled(0, 0, true);
-            Debug.LogWarning("Masking bug: no valid actions, unmasking 0");
+            // If we have blocks but no valid moves, the game is over - don't just enable action 0
+            Debug.LogWarning("No valid actions available - game should end");
+            CheckForGameOverAndEndEpisode();
         }
         
         // Debug log to track action masking timing
@@ -400,7 +433,13 @@ public class BlockBlastAgent : Agent
                 // The toggle is off, so use the original GridManager spawning logic.
                 gridManager.SpawnBlocks(3);
                 PrecomputeValidPlacements(); // We need to precompute for the new blocks
+                
+                // Only request decision if manual play is disabled
+                bool manualPlayEnabled = blockProviderAgent != null && blockProviderAgent.enableManualPlay;
+                if (!manualPlayEnabled)
+                {
                 RequestDecision(); // Tell this agent to think about its next move
+                }
             }
         }
         else
@@ -408,7 +447,13 @@ public class BlockBlastAgent : Agent
             // The dock is NOT empty. It's still this agent's turn.
             // It needs to decide which of the remaining blocks to place next.
             PrecomputeValidPlacements();
+            
+            // Only request decision if manual play is disabled
+            bool manualPlayEnabled = blockProviderAgent != null && blockProviderAgent.enableManualPlay;
+            if (!manualPlayEnabled)
+            {
             RequestDecision();
+            }
         }
        
         Academy.Instance.StatsRecorder.Add("Custom/GlobalStep", 1f, StatAggregationMethod.Average);

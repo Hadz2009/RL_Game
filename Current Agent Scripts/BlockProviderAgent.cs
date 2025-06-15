@@ -4,6 +4,7 @@ using Unity.MLAgents.Sensors;
 using Unity.MLAgents.Actuators;
 using System.Collections.Generic;
 using System.Linq;
+using System.Collections;
 
 /// <summary>
 /// An intelligent agent that provides blocks for a puzzle game.
@@ -29,6 +30,10 @@ public class BlockProviderAgent : Agent
     [SerializeField] private int topCandidatesToConsider = 7;
     [Tooltip("The number of blocks the agent provides each turn.")]
     private const int BLOCKS_TO_PROVIDE = 3;
+    
+    [Header("Manual Play Control")]
+    [Tooltip("When enabled, disables the PlayerAgent so you can play manually. BlockProviderAgent will still provide blocks.")]
+    public bool enableManualPlay = false;
     #endregion
 
     #region Reward Settings
@@ -38,7 +43,10 @@ public class BlockProviderAgent : Agent
     [SerializeField] private float comebackReward = 1.0f; // For saving a player from a high struggle state
     [SerializeField] private float gameOverPenalty = -2.0f;
     [SerializeField] private float stepPenalty = -0.01f;
-    [SerializeField] private float rankBasedReward = 0.1f;
+    [SerializeField] private float rankBasedReward = 0.02f;
+    
+    [Header("Reward Scaling")]
+    [SerializeField] private float rewardScaleFactor = 0.1f; // Scale all rewards down
     #endregion
 
     #region Struggle Score Weights
@@ -96,6 +104,35 @@ public class BlockProviderAgent : Agent
         Debug.Log($"Provider Agent Initialized with a vocabulary of {shapeVocabulary.Count} shapes.");
     }
 
+    private void Update()
+    {
+        // Check for manual mode game over
+        if (enableManualPlay && gridManager != null && gridManager.currentBlocks != null && gridManager.currentBlocks.Count > 0 )
+        {
+            // Don't check for game over if lines are currently being cleared
+            if (gridManager.isClearingLines)
+            {
+                return; // Wait for line clearing animations to complete
+            }
+            
+            bool hasValidMove = false;
+            foreach (var block in gridManager.currentBlocks)
+            {
+                if (block?.shape != null && gridManager.IsShapePlaceableAnywhere(block.shape))
+                {
+                    hasValidMove = true;
+                    break;
+                }
+            }
+            
+            if (!hasValidMove)
+            {
+                Debug.Log("Manual Game Over - No valid moves available!");
+                PlayerIsStuckAndGameIsOver();
+            }
+        }
+    }
+
     /// <summary>
     /// Called at the beginning of each training episode.
     /// </summary>
@@ -105,17 +142,21 @@ public class BlockProviderAgent : Agent
         gameManager.ResetScore();
         gridManager.ClearGrid();
         
-        // The episode starts with the Provider making the first move on an empty board.
+        // WARM-UP FIX: Initialize agent state to prevent first-episode performance issues
+        lastStruggleScore = 0.05f; // Start with a reasonable baseline instead of 0
+        topRankedCandidates.Clear(); // Clear any stale cache
+        
+        // The Provider Agent starts each episode by providing the first set of blocks
         RequestDecision();
     }
 
     /// <summary>
     /// The main decision-making trigger for this agent.
-    /// This should be called by the PlayerAgent after it has finished its turn.
+    /// This should ONLY be called when the dock is completely empty and new blocks are needed.
     /// </summary>
     public void RequestNewBlocks()
     {
-        // First, let's reward the agent for the outcome of the blocks it just provided.
+        // First, let's reward the agent for the outcome of the previous blocks it provided.
         EvaluateAndRewardOutcome();
 
         // Now, request a new decision for the next set of blocks.
@@ -231,6 +272,8 @@ public class BlockProviderAgent : Agent
     {
         var chosenActionIds = actions.DiscreteActions;
         
+        //Debug.Log($"PROVIDER DECISION: Chose blocks {chosenActionIds[0]}, {chosenActionIds[1]}, {chosenActionIds[2]}");
+        
         float totalRankReward = 0f;
 
         // Loop through the 3 choices the agent made
@@ -243,19 +286,39 @@ public class BlockProviderAgent : Agent
 
             if (rank != -1) // This will be true because of the action mask
             {
-                // Reward for picking higher-ranked blocks (rank 0 is best).
-                totalRankReward += (topCandidatesToConsider - rank) * rankBasedReward;
+                if(rank <= 3)
+                {
+                    // Reward for picking higher-ranked blocks (rank 0 is best).
+                    totalRankReward += (topCandidatesToConsider - rank) * rankBasedReward * 0.1f;
+                   // Debug.Log($"PROVIDER: Block {chosenShapeId} has rank {rank} (fitness: {topRankedCandidates[rank].OverallFitnessScore:F2})");
+                }
             }
 
             // Spawn the chosen block
             gridManager.SpawnSpecificBlock(shapeIdToShape[chosenShapeId]);
         }
         
-        AddReward(totalRankReward);
-        AddReward(stepPenalty);
+        AddRewardLog(totalRankReward, "Rank-Based Choice Quality");
+        AddRewardLog(stepPenalty, "Step Penalty");
         
-        // The method on the player agent is OnNewBlocksProvided, not StartTurnWithNewBlocks
-        playerAgent.OnNewBlocksProvided();
+        // FIXED: Use a coroutine to properly notify the player agent after a small delay
+        // This prevents timing synchronization issues
+        StartCoroutine(NotifyPlayerAgentAfterSpawn());
+    }
+
+    /// <summary>
+    /// Properly notifies the player agent that new blocks are available after a small delay
+    /// </summary>
+    private System.Collections.IEnumerator NotifyPlayerAgentAfterSpawn()
+    {
+        // Wait one frame to ensure all blocks are properly spawned
+        yield return null;
+        
+        // Only notify the player agent if manual play is disabled
+        if (playerAgent != null && !enableManualPlay)
+        {
+            playerAgent.OnNewBlocksProvided();
+        }
     }
 
     /// <summary>
@@ -296,9 +359,24 @@ public class BlockProviderAgent : Agent
     /// Called by the Player Agent when it determines the game is truly over.
     /// This agent, as the "Game Master," will formally end the episode.
     /// </summary>
+    /// 
+    /// <summary>
+/// A wrapper for AddReward that logs the source and value of the reward.
+/// </summary>
+    private void AddRewardLog(float value, string reason)
+    {
+        // Apply reward scaling to keep values in reasonable range
+        float scaledValue = value * rewardScaleFactor;
+        
+       // if (scaledValue != 0) // Only log non-zero rewards to keep the console clean
+       // {
+            //Debug.Log($"PROVIDER REWARD: {scaledValue.ToString("F3")} (unscaled: {value.ToString("F1")}) | REASON: {reason}");
+       // }
+        AddReward(scaledValue);
+    }
     public void PlayerIsStuckAndGameIsOver()
     {
-        AddReward(gameOverPenalty);
+        AddRewardLog(gameOverPenalty, "Game Over Penalty");
         EndEpisode();
     }
 
@@ -410,7 +488,7 @@ public class BlockProviderAgent : Agent
         int linesCleared = gridManager.GetLastLinesCleared();
         if (linesCleared >= 1)
         {
-            AddReward(linesCleared * linesCleared * multiLineClearBonus);
+            AddRewardLog(linesCleared * linesCleared * multiLineClearBonus, "Multi-Line Clear Bonus");
         }
 
         // Good Fit & Comeback Rewards
@@ -418,12 +496,12 @@ public class BlockProviderAgent : Agent
         if (currentStruggleScore < lastStruggleScore)
         {
             // The board state has improved. This is a "Good Fit".
-            AddReward(goodFitReward);
+            AddRewardLog(goodFitReward, "Good Fit Reward");
 
             // If the improvement was drastic from a bad state, this is a "Comeback".
             if (lastStruggleScore > 0.7f)
             {
-                AddReward(comebackReward);
+                AddRewardLog(comebackReward, "Comeback Reward");
             }
         }
     }
